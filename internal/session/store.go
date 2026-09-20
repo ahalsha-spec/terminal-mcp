@@ -236,10 +236,88 @@ type store struct {
 
 func newStore(max int) *store { return &store{max: max, m: map[string]*Session{}} }
 
+// sessionRetired reports sessions that no longer own usable execution capacity.
+// Only ready sessions are judged by PTY liveness; loading sessions are protected
+// from startup/hard-reset races and explicit dead/closed states are always retired.
+func sessionRetired(sess *Session) bool {
+	st, _ := sess.snapshotStatus()
+	if st == "dead" || st == "closed" {
+		return true
+	}
+	if st != "ready" {
+		return false
+	}
+	p := sess.getProc()
+	return p == nil || p.IsDead()
+}
+
+// removeIfSame removes id only when it still points at target. This makes reaping
+// safe against a stale snapshot racing with a replacement session.
+func (s *store) removeIfSame(id string, target *Session) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cur, ok := s.m[id]
+	if !ok || cur != target {
+		return false
+	}
+	delete(s.m, id)
+	return true
+}
+
+// reapDead reconciles process liveness with admission capacity. PTY EOF used to
+// mark ProcSession dead without removing its Session from the global store, so a
+// dead/hidden session could consume capacity until idle GC. Reaping is snapshot ->
+// liveness outside store lock -> pointer-conditional remove.
+func (s *store) reapDead() int {
+	s.mu.Lock()
+	candidates := make([]*Session, 0, len(s.m))
+	for _, sess := range s.m {
+		candidates = append(candidates, sess)
+	}
+	s.mu.Unlock()
+
+	reaped := 0
+	for _, sess := range candidates {
+		if !sessionRetired(sess) {
+			continue
+		}
+		st, _ := sess.snapshotStatus()
+		if s.removeIfSame(sess.ID, sess) {
+			if st == "ready" {
+				sess.setStatus("dead", "process exited")
+			}
+			reaped++
+		}
+	}
+	return reaped
+}
+
+// capacity returns truth after dead-session reconciliation.
+func (s *store) capacity() (used, max, available int) {
+	s.reapDead()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	used, max = len(s.m), s.max
+	available = max - used
+	if available < 0 {
+		available = 0
+	}
+	return
+}
+
+// Capacity exposes local admission truth for terminal_list diagnostics.
+func Capacity() (used, max, available int) {
+	if theStore == nil {
+		return 0, 0, 0
+	}
+	return theStore.capacity()
+}
+
 // InitStore 初始化全局会话表。
 func InitStore(maxSessions int) { theStore = newStore(maxSessions) }
 
 func (s *store) add(sess *Session) bool {
+	s.reapDead()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if len(s.m) >= s.max {
@@ -264,6 +342,7 @@ func (s *store) remove(id string) {
 }
 
 func (s *store) list() []*Session {
+	s.reapDead()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := make([]*Session, 0, len(s.m))

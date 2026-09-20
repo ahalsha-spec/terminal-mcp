@@ -67,8 +67,8 @@ func TestURLHostPort(t *testing.T) {
 func TestListFilfersByOwner(t *testing.T) {
 	InitStore(10)
 	SetSelfAddr("")
-	a := &Session{ID: "a", Owner: "alice", Status: "ready"}
-	b := &Session{ID: "b", Owner: "bob", Status: "ready"}
+	a := &Session{ID: "a", Owner: "alice", Status: "loading"}
+	b := &Session{ID: "b", Owner: "bob", Status: "loading"}
 	theStore.add(a)
 	theStore.add(b)
 

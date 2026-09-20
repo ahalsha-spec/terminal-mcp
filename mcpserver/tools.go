@@ -62,8 +62,15 @@ type sessionIDInput struct {
 type emptyInput struct{}
 
 // listOutput 包装会话列表：官方 SDK 要求工具输出为 JSON object，顶层数组不被接受。
+type capacityOutput struct {
+	Used      int `json:"used" jsonschema:"local admission slots currently occupied after dead-session reconciliation"`
+	Max       int `json:"max" jsonschema:"configured local admission limit"`
+	Available int `json:"available" jsonschema:"local admission slots currently available"`
+}
+
 type listOutput struct {
 	Sessions []map[string]string `json:"sessions" jsonschema:"active sessions with status snapshot (session_id, host, status, idle_seconds, held)"`
+	Capacity capacityOutput      `json:"capacity" jsonschema:"local instance admission capacity after dead-session reconciliation"`
 }
 
 // 工具描述（英文）。涵盖 PTY 会话、local/ssh 模式、
@@ -108,7 +115,7 @@ const (
 	descClose = "Close the session, releasing its child process and concurrency slot. " +
 		"If held=true the session is under human takeover: this call was NOT executed; wait until held clears."
 
-	descList = "List all sessions on this instance with their status snapshot (session_id, host, status, idle_seconds, held). " +
+	descList = "List all sessions on this instance with their status snapshot (session_id, host, status, idle_seconds, held) plus local capacity {used,max,available}. " +
 		"held=true means that session is under human takeover; pause write operations until it clears."
 )
 
@@ -288,7 +295,8 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			e := baseEntry(req, "terminal_list", nil)
 			e.Bytes = len(all)
 			a.Log(e)
-			return nil, listOutput{Sessions: all}, nil
+			used, max, available := session.Capacity()
+			return nil, listOutput{Sessions: all, Capacity: capacityOutput{Used: used, Max: max, Available: available}}, nil
 		})
 }
 

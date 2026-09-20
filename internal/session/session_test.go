@@ -50,6 +50,50 @@ func TestSendNonZeroExitCode(t *testing.T) {
 	}
 }
 
+func TestStrictModeBlockDoesNotKillPersistentShell(t *testing.T) {
+	id := openLocalReady(t)
+	defer Close(id)
+	env := Send(id, "set -euo pipefail\nfalse\necho SHOULD_NOT_RUN", 5000)
+	if env.State != "idle" {
+		t.Fatalf("strict block killed or wedged session: state=%q error=%q output=%q", env.State, env.Error, env.Output)
+	}
+	if env.ExitCode == nil || *env.ExitCode != 1 {
+		t.Fatalf("expected strict block exit code 1, got %v", env.ExitCode)
+	}
+	if strings.Contains(env.Output, "SHOULD_NOT_RUN") {
+		t.Fatalf("errexit semantics were lost: %q", env.Output)
+	}
+	env2 := Send(id, "echo parent-survived", 5000)
+	if env2.State != "idle" || env2.Output != "parent-survived" {
+		t.Fatalf("persistent parent did not survive strict block: state=%q output=%q error=%q", env2.State, env2.Output, env2.Error)
+	}
+}
+
+func TestStrictModeDoesNotLeakIntoLaterSend(t *testing.T) {
+	id := openLocalReady(t)
+	defer Close(id)
+	env := Send(id, "set -euo pipefail\nprintf x | grep y", 5000)
+	if env.State != "idle" || env.ExitCode == nil || *env.ExitCode != 1 {
+		t.Fatalf("strict pipefail block mismatch: state=%q code=%v output=%q", env.State, env.ExitCode, env.Output)
+	}
+	env2 := Send(id, "false; echo still-alive", 5000)
+	if env2.State != "idle" || env2.ExitCode == nil || *env2.ExitCode != 0 || env2.Output != "still-alive" {
+		t.Fatalf("strict options leaked into parent shell: state=%q code=%v output=%q", env2.State, env2.ExitCode, env2.Output)
+	}
+}
+
+func TestNormalSendStillPersistsWorkingDirectory(t *testing.T) {
+	id := openLocalReady(t)
+	defer Close(id)
+	if env := Send(id, "cd /tmp", 5000); env.State != "idle" || env.ExitCode == nil || *env.ExitCode != 0 {
+		t.Fatalf("cd failed: %+v", env)
+	}
+	env := Send(id, "pwd", 5000)
+	if env.Output != "/tmp" {
+		t.Fatalf("normal send lost persistent cwd: %q", env.Output)
+	}
+}
+
 func TestReadTailSeesBufferedOutput(t *testing.T) {
 	id := openLocalReady(t)
 	defer Close(id)

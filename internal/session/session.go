@@ -52,6 +52,62 @@ func selfAddr() string { return config.Get().ListenAddr }
 // 会话启动、每次切进新层 shell 的重新布哨（rearm）、hard reset 均复用它，保证：重开/切换 shell 后
 // 别名等仍生效，且资源限制在每个新 shell 上下文里重新注入（对模型透明，随布哨噪声被 since_last 跳过）。
 // 顺序：哨兵先行（供提示符检测）→ 资源限制次之（使随后的 init 命令也在限额内运行）→ init 命令。
+func enablesPersistentStrictMode(input string) bool {
+	for _, line := range strings.Split(input, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		for _, part := range strings.Split(line, ";") {
+			part = strings.TrimSpace(part)
+			if !strings.HasPrefix(part, "set ") {
+				continue
+			}
+			fields := strings.Fields(part)
+			if len(fields) < 2 || fields[0] != "set" {
+				continue
+			}
+			for i := 1; i < len(fields); i++ {
+				f := fields[i]
+				if f == "-o" && i+1 < len(fields) {
+					if fields[i+1] == "pipefail" || fields[i+1] == "errexit" || fields[i+1] == "nounset" {
+						return true
+					}
+				}
+				if strings.HasPrefix(f, "-") && !strings.HasPrefix(f, "+") {
+					opts := strings.TrimPrefix(f, "-")
+					if strings.Contains(opts, "e") || strings.Contains(opts, "u") {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func bashANSIQuote(s string) string {
+	r := strings.NewReplacer(
+		"\\", "\\\\",
+		"'", "\\'",
+		"\n", "\\n",
+		"\r", "\\r",
+		"\t", "\\t",
+	)
+	return "$'" + r.Replace(s) + "'"
+}
+
+func isolateStrictModeInput(input string) string {
+	if !enablesPersistentStrictMode(input) {
+		return input
+	}
+	// Preserve strict semantics for this submitted block while preventing shell-option
+	// leakage or errexit/nounset/pipefail from terminating the persistent parent PTY.
+	// ANSI-C quoting encodes embedded newlines so the wrapper is one physical PTY line;
+	// the existing echo cleaner can therefore remove it deterministically.
+	return "bash -c " + bashANSIQuote(input)
+}
+
 func sessionInitScript() string {
 	s := interp.SetBashSentinelCmd()
 	if rl := strings.TrimSpace(config.Get().ResourceLimitCmd); rl != "" {
@@ -192,7 +248,8 @@ func Send(id, input string, waitMs int) Envelope {
 		return Envelope{State: "dead", Error: "no live process"}
 	}
 	start := proc.Len()
-	proc.Write(input + "\n")
+	execInput := isolateStrictModeInput(input)
+	proc.Write(execInput + "\n")
 	deadline := time.Now().Add(capBlock(waitMs, 30000))
 	// 切换候选：命中切换注册表，或上一条切换命令停在鉴权问询、本条属于续作（pendingSwitch）。
 	// 续作场景（如 ssh 弹 (yes/no)? 后输入 yes、或再输入 password）真正进 shell 发生在本条输入上，
@@ -228,7 +285,7 @@ func Send(id, input string, waitMs int) Envelope {
 	// （既杜绝半截颜色漏给 LLM，也顺带修掉 setDelivered(Len()) 与 since() 分锁的丢字节竞态）。
 	k := clean.DeliverBoundary(raw, state)
 	sess.setDelivered(start + int64(k))
-	return finalizeScope(clean.CleanOutput(raw[:k], input), start, start+int64(k), state, prompt, code, input, false)
+	return finalizeScope(clean.CleanOutput(raw[:k], execInput), start, start+int64(k), state, prompt, code, input, false)
 }
 
 // sendWithRearm 在检测到切进新层 shell 后重新布哨（对模型透明，做进同一次 Send）。
