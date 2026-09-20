@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/fzxbl/terminal-mcp/internal/config"
 	"github.com/fzxbl/terminal-mcp/internal/pty"
 )
 
@@ -318,14 +319,56 @@ func InitStore(maxSessions int) { theStore = newStore(maxSessions) }
 
 func (s *store) add(sess *Session) bool {
 	s.reapDead()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if len(s.m) >= s.max {
-		return false
+
+	graceSeconds := config.Get().PressureReapIdleSeconds
+	if graceSeconds <= 0 {
+		graceSeconds = 30
 	}
+	pressureGrace := time.Duration(graceSeconds) * time.Second
+
+	var victim *Session
+	var victimIdle time.Duration
+	s.mu.Lock()
+	if len(s.m) >= s.max {
+		for _, candidate := range s.m {
+			if candidate.held() || !candidate.mu.TryLock() {
+				continue
+			}
+			state, _, _ := computeState(candidate)
+			idle := candidate.idleSince()
+			if state != "idle" || idle < pressureGrace {
+				candidate.mu.Unlock()
+				continue
+			}
+			if victim == nil || idle > victimIdle {
+				if victim != nil {
+					victim.mu.Unlock()
+				}
+				victim = candidate
+				victimIdle = idle
+			} else {
+				candidate.mu.Unlock()
+			}
+		}
+		if victim == nil {
+			s.mu.Unlock()
+			return false
+		}
+		delete(s.m, victim.ID)
+	}
+
 	sess.CreatedAt = time.Now()
 	sess.lastUsed = sess.CreatedAt
 	s.m[sess.ID] = sess
+	s.mu.Unlock()
+
+	if victim != nil {
+		if p := victim.getProc(); p != nil {
+			p.Close()
+		}
+		victim.setStatus("closed", "capacity pressure: reclaimed idle session")
+		victim.mu.Unlock()
+	}
 	return true
 }
 

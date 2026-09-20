@@ -14,6 +14,7 @@ type Config struct {
 	DefaultShell            string `toml:"default_shell"`
 	MaxSessions             int    `toml:"max_sessions"`
 	IdleTTLMinutes          int    `toml:"idle_ttl_minutes"`
+	PressureReapIdleSeconds int    `toml:"pressure_reap_idle_seconds"`
 	ExecOutputMaxBytes      int64  `toml:"exec_output_max_bytes"`
 	MaxBufferBytes          int    `toml:"max_buffer_bytes"`
 	OpenReadyTimeoutMinutes int    `toml:"open_ready_timeout_minutes"`
@@ -118,6 +119,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.IdleTTLMinutes <= 0 {
 		c.IdleTTLMinutes = 30
+	}
+	if c.PressureReapIdleSeconds <= 0 {
+		c.PressureReapIdleSeconds = 30
 	}
 	if c.ExecOutputMaxBytes <= 0 {
 		c.ExecOutputMaxBytes = 1 << 20
