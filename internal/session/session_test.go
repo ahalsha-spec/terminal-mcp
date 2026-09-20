@@ -229,6 +229,22 @@ func TestGrepSshNotRearmed(t *testing.T) {
 
 // TestManualRearm 直接写入切换命令（绕过 Send 的自动布哨），再用 terminal_control(rearm)
 // 手动恢复哨兵；随后普通 Send 应正常工作、state=idle。
+func TestOpenAbsorbsNormalReadiness(t *testing.T) {
+	config.Load("")
+	InitStore(config.Get().MaxSessions)
+	res, err := Open("local", "", "", "owner")
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer Close(res["session_id"])
+	if got := res["state"]; got != "idle" {
+		t.Fatalf("Open state = %q, want idle", got)
+	}
+	if env := Send(res["session_id"], "echo OPEN_READY_OK", 5000); env.State != "idle" || !strings.Contains(env.Output, "OPEN_READY_OK") {
+		t.Fatalf("immediate Send after Open = %+v", env)
+	}
+}
+
 func TestManualRearm(t *testing.T) {
 	id := openLocalReady(t)
 	defer Close(id)

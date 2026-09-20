@@ -78,7 +78,7 @@ type listOutput struct {
 const (
 	descOpen = "Start a persistent real PTY session and return {session_id, state, terminal_url}. " +
 		"mode=local spawns a shell (or the given command) on this host; mode=ssh opens 'ssh <host>' running bash (host is required). " +
-		"The session starts in state=loading; poll terminal_status until it becomes idle before interacting. " +
+		"The server absorbs normal shell readiness before returning; state is normally idle. If an unusually slow startup still returns loading, wait meaningfully before one terminal_status check rather than rapid polling. " +
 		"terminal_url is a read-only web terminal a human can open to watch the session live, and optionally 'take over' to type commands manually. " +
 		"While a human has taken over, the session returns held=true and the model's send/close/control are blocked; use terminal_output(mode=since_last) to observe what the human is doing."
 

@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
+	"time"
 
 	"github.com/fzxbl/terminal-mcp/internal/config"
 )
@@ -130,7 +131,7 @@ func localIP() string {
 //	mode=local: 起本地 shell，command 为可选自定义命令（空则默认 shell）
 //	mode=ssh:   ssh 到 host 上起 bash，command 忽略
 //
-// 用 Status 轮询到 idle/ready 后再交互；terminal_url 供人在浏览器观看并可"人工接管"。
+// Open 内部吸收正常 shell readiness；通常直接返回 state=idle。极慢启动才返回 loading；terminal_url 供人在浏览器观看并可"人工接管"。
 //
 // Open 起持久真 PTY 会话。owner 为调用方归属签名（见 internal/identity），写入会话用于归属隔离。
 func Open(mode, command, host, owner string) (map[string]string, error) {
@@ -154,12 +155,40 @@ func Open(mode, command, host, owner string) (map[string]string, error) {
 	if _, err := startSessionTracked(id, host, mode, name, args); err != nil {
 		return nil, err
 	}
-	if s := theStore.get(id); s != nil {
-		s.Owner = owner
+	sess := theStore.get(id)
+	if sess != nil {
+		sess.Owner = owner
 	}
+
+	// Absorb normal shell initialization inside terminal_open so clients do not
+	// need an open -> status polling cascade. This is only a readiness wait, not
+	// a command-execution deadline; unusually slow startup still returns loading.
+	state := "loading"
+	deadline := time.Now().Add(10 * time.Second)
+	if max := time.Duration(config.Get().MaxBlockSeconds) * time.Second; max > 0 && max < 10*time.Second {
+		deadline = time.Now().Add(max)
+	}
+	for sess != nil && time.Now().Before(deadline) {
+		st, _ := sess.snapshotStatus()
+		switch st {
+		case "ready":
+			state, _, _ = computeState(sess)
+			if state == "idle" {
+				deadline = time.Time{}
+			}
+		case "dead", "closed":
+			state = "dead"
+			deadline = time.Time{}
+		}
+		if deadline.IsZero() {
+			break
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+
 	return map[string]string{
 		"session_id":   id,
-		"state":        "loading",
+		"state":        state,
 		"terminal_url": terminalURL(id),
 	}, nil
 }
