@@ -86,6 +86,24 @@ func (s *Session) idleSince() time.Duration {
 	return time.Since(s.lastUsed)
 }
 
+// activityAge measures time since the newest tool/model touch or PTY output.
+// PTY output matters because a long-running command can finish after the last
+// MCP call; its completion output/prompt must reset reclaim eligibility.
+func (s *Session) activityAge() time.Duration {
+	s.stateMu.Lock()
+	last := s.lastUsed
+	s.stateMu.Unlock()
+	if p := s.getProc(); p != nil {
+		if out := p.LastByteTime(); out.After(last) {
+			last = out
+		}
+	}
+	if last.IsZero() {
+		return 0
+	}
+	return time.Since(last)
+}
+
 // setDelivered 加 stateMu 写交付游标。
 func (s *Session) setDelivered(n int64) { s.stateMu.Lock(); s.deliveredOffset = n; s.stateMu.Unlock() }
 
@@ -284,6 +302,9 @@ func (s *store) reapDead() int {
 		}
 		st, _ := sess.snapshotStatus()
 		if s.removeIfSame(sess.ID, sess) {
+			if p := sess.getProc(); p != nil {
+				p.Close()
+			}
 			if st == "ready" {
 				sess.setStatus("dead", "process exited")
 			}
@@ -291,6 +312,24 @@ func (s *store) reapDead() int {
 		}
 	}
 	return reaped
+}
+
+// reclaimablePromptIdle is the common safety predicate for both admission
+// pressure and ordinary idle GC. Loading/running/human-held sessions are never
+// eligible; recent PTY output counts as activity even when no new MCP call arrived.
+func reclaimablePromptIdle(sess *Session, minIdle time.Duration) bool {
+	if sess == nil || sess.held() {
+		return false
+	}
+	st, _ := sess.snapshotStatus()
+	if st != "ready" {
+		return false
+	}
+	state, _, _ := computeState(sess)
+	if state != "idle" {
+		return false
+	}
+	return sess.activityAge() >= minIdle
 }
 
 // capacity returns truth after dead-session reconciliation.
@@ -331,12 +370,11 @@ func (s *store) add(sess *Session) bool {
 	s.mu.Lock()
 	if len(s.m) >= s.max {
 		for _, candidate := range s.m {
-			if candidate.held() || !candidate.mu.TryLock() {
+			if !candidate.mu.TryLock() {
 				continue
 			}
-			state, _, _ := computeState(candidate)
-			idle := candidate.idleSince()
-			if state != "idle" || idle < pressureGrace {
+			idle := candidate.activityAge()
+			if !reclaimablePromptIdle(candidate, pressureGrace) {
 				candidate.mu.Unlock()
 				continue
 			}
@@ -395,22 +433,29 @@ func (s *store) list() []*Session {
 	return out
 }
 
-// gcIdle 关闭并移除空闲超过 ttl 的会话。
+// gcIdle reaps only genuinely prompt-idle sessions. A running command, shell
+// startup, or human takeover must never be killed merely because the last MCP
+// call is older than the TTL. Recent PTY output also resets effective activity.
 func (s *store) gcIdle(ttl time.Duration) {
+	s.reapDead()
 	s.mu.Lock()
-	victims := []*Session{}
-	for id, v := range s.m {
-		if v.idleSince() > ttl {
-			victims = append(victims, v)
-			delete(s.m, id)
-		}
+	candidates := make([]*Session, 0, len(s.m))
+	for _, sess := range s.m {
+		candidates = append(candidates, sess)
 	}
 	s.mu.Unlock()
-	for _, v := range victims {
-		if p := v.getProc(); p != nil {
-			p.Close()
+
+	for _, sess := range candidates {
+		if !sess.mu.TryLock() {
+			continue
 		}
-		v.setStatus("closed", "")
+		if reclaimablePromptIdle(sess, ttl) && s.removeIfSame(sess.ID, sess) {
+			if p := sess.getProc(); p != nil {
+				p.Close()
+			}
+			sess.setStatus("closed", "")
+		}
+		sess.mu.Unlock()
 	}
 }
 

@@ -16,12 +16,13 @@ import (
 // ProcSession 持有一个 live 子进程（顶层 shell），经 PTY master 读写；
 // 后台 goroutine 持续把 master 输出 append 到 oplog（磁盘 .raw 为唯一真相源）。
 type ProcSession struct {
-	cmd      *exec.Cmd
-	ptmx     *os.File
-	mu       sync.Mutex
-	lastByte time.Time
-	dead     bool
-	log      *oplog.Log
+	cmd       *exec.Cmd
+	ptmx      *os.File
+	mu        sync.Mutex
+	lastByte  time.Time
+	dead      bool
+	log       *oplog.Log
+	closeOnce sync.Once
 }
 
 // PTY 默认窗口：故意设很宽，避免模型的宽输出被终端宽度硬换行污染；
@@ -152,13 +153,15 @@ func (p *ProcSession) KillLine() { _, _ = p.ptmx.Write([]byte{0x15}) }
 // 对 ssh 远端会话：kill 本地 ssh 客户端 + 关 PTY 会令远端 sshd 挂断（SIGHUP），远端前台
 // gdb 随之退出；本地 gdb（local 模式）则由进程组 kill 直接带走。最后 Wait 回收僵尸。
 func (p *ProcSession) Close() {
-	_ = p.ptmx.Close()
-	if p.cmd.Process != nil {
-		pid := p.cmd.Process.Pid
-		// 子进程以 Setpgid 建组，pgid==pid，负号对整组发信号，带走全部孙进程。
-		_ = syscall.Kill(-pid, syscall.SIGKILL)
-		_ = p.cmd.Process.Kill() // 兜底：万一未成组，至少杀掉直接子进程
-	}
-	go func() { _ = p.cmd.Wait() }() // 回收僵尸进程
-	_ = p.log.Close()
+	p.closeOnce.Do(func() {
+		_ = p.ptmx.Close()
+		if p.cmd.Process != nil {
+			pid := p.cmd.Process.Pid
+			// 子进程以 Setpgid 建组，pgid==pid，负号对整组发信号，带走全部孙进程。
+			_ = syscall.Kill(-pid, syscall.SIGKILL)
+			_ = p.cmd.Process.Kill() // 兜底：万一未成组，至少杀掉直接子进程
+		}
+		go func() { _ = p.cmd.Wait() }() // 回收僵尸进程
+		_ = p.log.Close()
+	})
 }

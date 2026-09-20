@@ -88,3 +88,12 @@ func TestProcTranscriptWriteThrough(t *testing.T) {
 		t.Fatalf("transcript missing output: %q", string(b))
 	}
 }
+
+func TestProcCloseIsIdempotent(t *testing.T) {
+	p, err := NewProcSession(filepath.Join(t.TempDir(), "close-twice.raw"), 1<<20, "bash", "--norc", "--noprofile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Close()
+	p.Close()
+}
