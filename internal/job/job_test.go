@@ -1096,3 +1096,53 @@ func TestPrepareCgroupIsolationReapsDeadSibling(t *testing.T) {
 		t.Fatalf("dead sibling namespace not reaped: %v", err)
 	}
 }
+
+func TestResultForWaitReachesTerminal(t *testing.T) {
+	Init(testConfig(t, 1, 8, 8, 1))
+	defer Shutdown()
+
+	snap, err := Submit("wait-owner", SubmitArgs{Command: "sleep 0.2; printf done"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	start := time.Now()
+	res, err := ResultForWait("wait-owner", snap.JobID, 4096, 2*time.Second)
+	if err != nil {
+		t.Fatalf("result wait: %v", err)
+	}
+	if res.Snapshot.State != "succeeded" {
+		t.Fatalf("expected succeeded, got %+v", res.Snapshot)
+	}
+	if res.Output != "done" {
+		t.Fatalf("expected output done, got %q", res.Output)
+	}
+	if elapsed := time.Since(start); elapsed < 150*time.Millisecond {
+		t.Fatalf("result returned before job could complete: %v", elapsed)
+	}
+}
+
+func TestResultForWaitReturnsAtBound(t *testing.T) {
+	Init(testConfig(t, 1, 8, 8, 1))
+	defer Shutdown()
+
+	snap, err := Submit("wait-owner", SubmitArgs{Command: "sleep 1"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	start := time.Now()
+	res, err := ResultForWait("wait-owner", snap.JobID, 4096, 100*time.Millisecond)
+	if err != nil {
+		t.Fatalf("result wait: %v", err)
+	}
+	elapsed := time.Since(start)
+	if isTerminalState(res.Snapshot.State) {
+		t.Fatalf("expected non-terminal snapshot at wait bound, got %+v", res.Snapshot)
+	}
+	if elapsed < 80*time.Millisecond || elapsed > 500*time.Millisecond {
+		t.Fatalf("bounded wait duration out of range: %v", elapsed)
+	}
+	if _, err := Cancel("wait-owner", snap.JobID); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	_ = waitState(t, "wait-owner", snap.JobID, true)
+}

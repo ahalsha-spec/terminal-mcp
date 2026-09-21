@@ -102,6 +102,7 @@ type jobIDInput struct {
 type jobResultInput struct {
 	JobID    string `json:"job_id" jsonschema:"the job id returned by job_submit"`
 	MaxBytes int64  `json:"max_bytes,omitempty" jsonschema:"maximum tail bytes to return; clamped by the server"`
+	WaitMs   int    `json:"wait_ms,omitempty" jsonschema:"max milliseconds to wait for the job to reach a terminal state before returning; default 30000, capped by server max_block_seconds. Use job_status for an immediate non-blocking snapshot."`
 }
 
 type controlInput struct {
@@ -181,8 +182,10 @@ const (
 	descJobGraphSubmit = "Submit a bounded named dependency DAG in one MCP call. " +
 		"Independent nodes may run concurrently; depends_on edges serialize only true prerequisites; lock_keys prevent conflicting resource overlap. " +
 		"The graph is validated and queue-admitted atomically, so cycles or capacity failures leave no partial graph. graph_key makes exact retries idempotent and rejects changed definitions."
-	descJobStatus = "Read one job's state. Use for genuinely asynchronous work; do not rapid-poll."
-	descJobResult = "Read a bounded tail of a job's disk-backed output. Large output stays local; max_bytes is clamped by the server."
+	descJobStatus = "Read one job's state immediately without waiting. Use this when you explicitly need a non-blocking snapshot."
+	descJobResult = "Wait boundedly for a job to reach a terminal state, then read a bounded tail of its disk-backed output. " +
+		"wait_ms defaults to 30000 and is capped by server max_block_seconds; if the bound expires first, the current queued/running snapshot is returned so the caller can do other work instead of rapid-polling. " +
+		"Large output stays local; max_bytes is clamped by the server. Prefer this over repeated job_status/job_result polling when waiting for normal job completion."
 	descJobCancel = "Cancel queued or running work owned by this caller. Running process groups are terminated; use when work becomes stale or is superseded."
 	descJobList   = "List this caller's jobs plus global scheduler capacity: active/max_active, queued/max_queued, and cpu_heavy_active/max_cpu_heavy."
 
@@ -245,6 +248,20 @@ func resolveDesc(name string) string {
 		}
 	}
 	return defaultDescriptions[name]
+}
+
+func jobResultWait(waitMs int) time.Duration {
+	maxMs := config.Get().MaxBlockSeconds * 1000
+	if maxMs <= 0 {
+		maxMs = 30000
+	}
+	if waitMs <= 0 {
+		waitMs = 30000
+	}
+	if waitMs > maxMs {
+		waitMs = maxMs
+	}
+	return time.Duration(waitMs) * time.Millisecond
 }
 
 // registerTools 在给定 server 上注册全部 terminal_* 工具。
@@ -366,8 +383,11 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			if !ok {
 				return nil, job.Result{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
 			}
-			res, err := job.ResultFor(owner, in.JobID, in.MaxBytes)
-			e := baseEntry(req, "job_result", map[string]any{"job_id": in.JobID, "max_bytes": in.MaxBytes})
+			wait := jobResultWait(in.WaitMs)
+			res, err := job.ResultForWait(owner, in.JobID, in.MaxBytes, wait)
+			e := baseEntry(req, "job_result", map[string]any{
+				"job_id": in.JobID, "max_bytes": in.MaxBytes, "wait_ms": wait.Milliseconds(),
+			})
 			if err != nil {
 				e.Error = err.Error()
 			} else {

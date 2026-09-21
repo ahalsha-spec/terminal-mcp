@@ -1025,6 +1025,36 @@ func ResultFor(owner, id string, maxBytes int64) (Result, error) {
 	return Result{Snapshot: snap, Output: string(b), Truncated: truncated}, nil
 }
 
+// ResultForWait waits up to wait for the job to reach a terminal state, then
+// returns the same bounded disk-backed result as ResultFor. A bounded wait keeps
+// asynchronous completion inside the server instead of forcing MCP callers to
+// rapid-poll. If the deadline expires first, the current queued/running
+// snapshot and output-so-far are returned.
+func ResultForWait(owner, id string, maxBytes int64, wait time.Duration) (Result, error) {
+	if wait <= 0 {
+		return ResultFor(owner, id, maxBytes)
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		snap, err := Status(owner, id)
+		if err != nil {
+			return Result{}, err
+		}
+		if isTerminalState(snap.State) {
+			return ResultFor(owner, id, maxBytes)
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return ResultFor(owner, id, maxBytes)
+		}
+		sleepFor := 100 * time.Millisecond
+		if remaining < sleepFor {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+	}
+}
+
 func (s *store) sweepOrphanOutputs(cutoff time.Time) {
 	jobsDir := filepath.Join(s.cfg.DataDir, "jobs")
 	live := make(map[string]struct{})

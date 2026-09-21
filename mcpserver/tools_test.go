@@ -58,6 +58,14 @@ func TestExploreToolSchemaSplit(t *testing.T) {
 		schemas[tl.Name] = string(b)
 	}
 
+	jr, ok := schemas["job_result"]
+	if !ok {
+		t.Fatalf("job_result not registered; tools=%v", schemas)
+	}
+	if !strings.Contains(jr, "\"wait_ms\":") {
+		t.Fatalf("job_result schema missing wait_ms: %s", jr)
+	}
+
 	exp, ok := schemas["terminal_explore"]
 	if !ok {
 		t.Fatalf("terminal_explore not registered; tools=%v", schemas)
