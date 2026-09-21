@@ -1,6 +1,7 @@
 package pty
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -96,4 +97,48 @@ func TestProcCloseIsIdempotent(t *testing.T) {
 	}
 	p.Close()
 	p.Close()
+}
+
+func TestProcCloseKillsDetachedSetsidDescendant(t *testing.T) {
+	p, err := NewProcSession(filepath.Join(t.TempDir(), "setsid.raw"), 1<<20, "bash", "--norc", "--noprofile")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pidFile := filepath.Join(t.TempDir(), "setsid.pid")
+	p.Write("setsid sh -c 'echo $$ > " + pidFile + "; exec sleep 300' </dev/null >/dev/null 2>&1 &\n")
+	var pid int
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, rerr := os.ReadFile(pidFile)
+		if rerr == nil {
+			if _, err := fmt.Sscanf(strings.TrimSpace(string(b)), "%d", &pid); err == nil && pid > 0 {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid <= 0 {
+		p.Close()
+		t.Fatal("detached setsid child never reported pid")
+	}
+	p.Close()
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		b, rerr := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+		if os.IsNotExist(rerr) {
+			return
+		}
+		if rerr == nil {
+			end := strings.LastIndexByte(string(b), ')')
+			if end >= 0 {
+				fields := strings.Fields(string(b[end+1:]))
+				if len(fields) > 0 && fields[0] == "Z" {
+					return
+				}
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	t.Fatalf("detached setsid child %d survived ProcSession.Close", pid)
 }

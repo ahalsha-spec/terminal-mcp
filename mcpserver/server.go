@@ -19,7 +19,7 @@ const serverName = "terminal-mcp"
 
 // serverVersion is overridden at release build time with -ldflags -X so MCP
 // initialize receipts bind clients to the exact deployed source generation.
-var serverVersion = "v0.9.0-mu.2-dev"
+var serverVersion = "v0.9.0-mu.3-dev"
 
 // Init loads config from the given TOML path (empty string = defaults only)
 // and initializes the session store. Must be called before RegisterTools or

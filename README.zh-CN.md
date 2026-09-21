@@ -83,7 +83,7 @@ Agent 会开会话、跑命令、把结果流式带回。如果它需要输密�
 
 | 工具 | 作用 |
 | --- | --- |
-| `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?)` | 提交有界的非交互任务，不占用持久 PTY；支持事务化 supersession、精确重试幂等、依赖与全局资源锁。 |
+| `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?, wait_ms?, max_bytes?, async?)` | 提交有界非交互任务；默认在同一次 MCP 调用中有界等待最多 30 秒（受 `max_block_seconds` 限制）并返回终态 + 有界输出，仅在确实需要异步提交时设置 `async=true`。 |
 | `job_batch_submit(items)` | 一次 MCP 调用提交有界批次；每项按全局/调用方背压独立接纳或拒绝。 |
 | `job_graph_submit(graph_key?, nodes)` | 原子校验并接纳命名依赖 DAG；独立节点并发，仅由真实依赖与锁边串行化。 |
 | `job_status(job_id)` | 读取当前调用方拥有的单个任务状态。 |
@@ -96,11 +96,11 @@ Agent 会开会话、跑命令、把结果流式带回。如果它需要输密�
 | `terminal_explore(session_id, output_ref, op, line_offset?, limit?, pattern?, before?, after?, max_bytes?, byte_offset?)` | 探索超大结果（`terminal_send`/`since_last` 截断时回传的 `output_ref`），无需整段翻页：`op=stat` 看规模/行数，`op=grep` 用 `pattern`/`before`/`after` 定位，`op=read` 用 `line_offset`/`limit` 取局部（`line_offset` 为负从尾部倒数）。只读，不推进游标。 |
 | `terminal_control(session_id, key)` | 发送控制键（`ctrl-c`、`ctrl-d`、`ctrl-z` …）或恢复动作（`flush`、`hard`、`rearm`）。 |
 | `terminal_status(session_id)` | 轻量查询 状态 / 提示符 / 退出码 / 是否被接管。 |
-| `terminal_close(session_id)` | 关闭会话，回收进程组。 |
+| `terminal_close(session_id)` | 关闭会话；Linux cgroup v2 可用时回收会话完整本地后代树，否则退回进程组机制。 |
 | `terminal_list()` | 列出活跃会话。 |
 
 
-非交互 job plane 将**逻辑需求与物理执行解耦**：许多调用方可以排队提交工作，而有界自适应调度器只放行机器当前能够安全承载的物理执行。在 Linux cgroup v2 上，每个 server 进程拥有基于 PID + 进程启动时间的 worker 命名空间，每个已接纳 job 进入独立子 cgroup；成功、失败、取消和超时都会在释放调度容量前回收完整后代子树。启动清理不会碰仍存活的兄弟 server 命名空间，只回收其属主进程已被证明死亡的残留命名空间。若检测到 cgroup v2 但无法安全准备 containment，job 会 fail closed；没有 cgroup v2 的系统保留进程组 fallback。持久 PTY 仍是独立资源，只用于真正需要交互状态的工作。
+非交互 job plane 将**逻辑需求与物理执行解耦**：许多调用方可以排队提交工作，而有界自适应调度器只放行机器当前能够安全承载的物理执行。在 Linux cgroup v2 上，每个 server 进程拥有基于 PID + 进程启动时间的 worker 命名空间，每个已接纳 job 进入独立子 cgroup；成功、失败、取消和超时都会在释放调度容量前回收完整后代子树。启动清理不会碰仍存活的兄弟 server 命名空间，只回收其属主进程已被证明死亡的残留命名空间。若检测到 cgroup v2 但无法安全准备 containment，job 会 fail closed；没有 cgroup v2 的系统保留进程组 fallback。持久 PTY 仍是独立资源，只用于真正需要交互状态的工作；Linux cgroup v2 上每个 PTY 会话使用启动门 + 独立会话 cgroup，因此 `setsid` / daemonized 后代也不能逃逸 close、idle GC 或 shutdown。
 
 ## 配置
 

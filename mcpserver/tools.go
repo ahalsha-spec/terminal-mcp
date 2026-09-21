@@ -61,10 +61,30 @@ type jobSubmitInput struct {
 	DependsOn      []string `json:"depends_on,omitempty" jsonschema:"existing job ids owned by this caller that must succeed before this job may run"`
 	LockKeys       []string `json:"lock_keys,omitempty" jsonschema:"global mutual-exclusion resource keys; conflicting jobs wait rather than overlap"`
 	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to its configured maximum"`
+	WaitMs         int      `json:"wait_ms,omitempty" jsonschema:"bounded milliseconds to stay attached after admission; default 30000 and capped by max_block_seconds"`
+	MaxBytes       int64    `json:"max_bytes,omitempty" jsonschema:"maximum output tail bytes returned by this submit call; clamped by the server"`
+	Async          bool     `json:"async,omitempty" jsonschema:"set true only when immediate asynchronous admission is desired; otherwise job_submit waits boundedly and returns output in this same call"`
+}
+
+type jobBatchItemInput struct {
+	Command        string   `json:"command" jsonschema:"non-interactive command to execute through the bounded job scheduler"`
+	Cwd            string   `json:"cwd,omitempty" jsonschema:"optional working directory"`
+	Class          string   `json:"class,omitempty" jsonschema:"normal | cpu_heavy | io_wait | background"`
+	SupersedeKey   string   `json:"supersede_key,omitempty" jsonschema:"optional logical key; newer jobs from this caller cancel older queued/running jobs with the same key"`
+	IdempotencyKey string   `json:"idempotency_key,omitempty" jsonschema:"optional retry key; identical replay returns the existing job, changed payload under the same key is rejected"`
+	DependsOn      []string `json:"depends_on,omitempty" jsonschema:"existing job ids owned by this caller that must succeed before this job may run"`
+	LockKeys       []string `json:"lock_keys,omitempty" jsonschema:"global mutual-exclusion resource keys; conflicting jobs wait rather than overlap"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to its configured maximum"`
 }
 
 type jobBatchInput struct {
-	Items []jobSubmitInput `json:"items" jsonschema:"independent jobs to admit in one call; bounded by job_max_batch and normal queue limits"`
+	Items []jobBatchItemInput `json:"items" jsonschema:"independent jobs to admit in one call; bounded by job_max_batch and normal queue limits"`
+}
+
+type jobSubmitOutput struct {
+	job.Snapshot
+	Output    string `json:"output,omitempty"`
+	Truncated bool   `json:"truncated,omitempty"`
 }
 
 type jobGraphNodeInput struct {
@@ -172,9 +192,9 @@ const (
 		"held=true means a human has taken over: the model should pause write operations and only read until held becomes false; " +
 		"use terminal_output(mode=since_last) to see what the human executed."
 
-	descJobSubmit = "Submit bounded non-interactive machine work without consuming a persistent PTY. " +
-		"Prefer this for tests, builds, searches, file transforms and deterministic scripts. The scheduler admits many logical callers but bounds physical execution, applies per-caller/global queue limits, and round-robins across callers. " +
-		"Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. " +
+	descJobSubmit = "Submit bounded non-interactive machine work without consuming a persistent PTY, then by default stay attached for up to 30000 ms and return terminal state plus bounded output in this same MCP call. " +
+		"Prefer this single-call path for normal tests, builds, searches, file transforms and deterministic scripts; set async=true only when immediate asynchronous admission is genuinely required. wait_ms is capped by max_block_seconds and max_bytes bounds returned output. " +
+		"The scheduler still bounds physical execution, applies per-caller/global queue limits, and round-robins across callers. Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. " +
 		"supersede_key cancels stale same-purpose work; idempotency_key deduplicates exact retries and rejects changed payloads; depends_on gates execution on prior successful jobs; lock_keys serialize conflicting resources."
 	descJobBatchSubmit = "Submit a bounded batch of non-interactive jobs in one MCP call. " +
 		"Use this instead of many serial tool calls when work is separable. Each item supports idempotency, existing-job dependencies and lock keys. " +
@@ -264,33 +284,50 @@ func jobResultWait(waitMs int) time.Duration {
 	return time.Duration(waitMs) * time.Millisecond
 }
 
+func submitAndMaybeWait(owner string, in jobSubmitInput) (jobSubmitOutput, error) {
+	snap, err := job.Submit(owner, job.SubmitArgs{
+		Command: in.Command, Cwd: in.Cwd, Class: in.Class, SupersedeKey: in.SupersedeKey,
+		IdempotencyKey: in.IdempotencyKey, DependsOn: in.DependsOn, LockKeys: in.LockKeys,
+		Timeout: time.Duration(in.TimeoutSeconds) * time.Second,
+	})
+	out := jobSubmitOutput{Snapshot: snap}
+	if err != nil || in.Async {
+		return out, err
+	}
+	res, err := job.ResultForWait(owner, snap.JobID, in.MaxBytes, jobResultWait(in.WaitMs))
+	if err != nil {
+		return out, err
+	}
+	out.Snapshot = res.Snapshot
+	out.Output = res.Output
+	out.Truncated = res.Truncated
+	return out, nil
+}
+
 // registerTools 在给定 server 上注册全部 terminal_* 工具。
 // 每个 handler 计算结果后调用 audit.Logger 记录一条审计。CallerIP 从 HTTP 请求头解析
 // （官方 SDK 通过 CallToolRequest.Extra.Header 把 HTTP header 透传给每个工具 handler）。
 func registerTools(server *mcp.Server, a *audit.Logger) {
 	mcp.AddTool(server, &mcp.Tool{Name: "job_submit", Description: resolveDesc("job_submit")},
-		func(_ context.Context, req *mcp.CallToolRequest, in jobSubmitInput) (*mcp.CallToolResult, job.Snapshot, error) {
+		func(_ context.Context, req *mcp.CallToolRequest, in jobSubmitInput) (*mcp.CallToolResult, jobSubmitOutput, error) {
 			owner, ok := ownerSig(req)
 			if !ok {
-				return nil, job.Snapshot{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+				return nil, jobSubmitOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
 			}
-			snap, err := job.Submit(owner, job.SubmitArgs{
-				Command: in.Command, Cwd: in.Cwd, Class: in.Class, SupersedeKey: in.SupersedeKey,
-				IdempotencyKey: in.IdempotencyKey, DependsOn: in.DependsOn, LockKeys: in.LockKeys,
-				Timeout: time.Duration(in.TimeoutSeconds) * time.Second,
-			})
+			out, err := submitAndMaybeWait(owner, in)
 			e := baseEntry(req, "job_submit", map[string]any{
 				"class": in.Class, "cwd": in.Cwd, "supersede_key": in.SupersedeKey,
 				"idempotency_key": in.IdempotencyKey, "depends_on": len(in.DependsOn), "lock_keys": len(in.LockKeys),
-				"timeout_seconds": in.TimeoutSeconds,
+				"timeout_seconds": in.TimeoutSeconds, "async": in.Async, "wait_ms": in.WaitMs, "max_bytes": in.MaxBytes,
 			})
 			if err != nil {
 				e.Error = err.Error()
 			} else {
-				e.State = snap.State
+				e.State = out.State
+				e.Bytes = len(out.Output)
 			}
 			a.Log(e)
-			return nil, snap, err
+			return nil, out, err
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "job_batch_submit", Description: resolveDesc("job_batch_submit")},

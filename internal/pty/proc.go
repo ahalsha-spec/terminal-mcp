@@ -1,6 +1,7 @@
 package pty
 
 import (
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -22,6 +23,7 @@ type ProcSession struct {
 	lastByte  time.Time
 	dead      bool
 	log       *oplog.Log
+	cgroup    *sessionCgroup
 	closeOnce sync.Once
 }
 
@@ -49,19 +51,70 @@ func NewProcSession(logPath string, cacheBytes int, name string, args ...string)
 		return nil, err
 	}
 	_ = pty.Setsize(ptmx, &pty.Winsize{Rows: defaultPtyRows, Cols: defaultPtyCols})
-	cmd := exec.Command(name, args...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
-	// Setsid + Setctty：子进程新建会话并把 tty（stdin, fd 0）设为受控终端。close 时对
-	// 进程组（pgid==pid，会话首进程）发信号即可一次性带走其 fork 的 gdb/python 等孙进程。
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
-	if err := cmd.Start(); err != nil {
+	cg, err := createSessionCgroup()
+	if err != nil {
 		_ = ptmx.Close()
 		_ = tty.Close()
 		_ = lg.Close()
 		return nil, err
 	}
+
+	var gateR, gateW *os.File
+	var cmd *exec.Cmd
+	if cg != nil {
+		gateR, gateW, err = os.Pipe()
+		if err != nil {
+			_ = cg.close()
+			_ = ptmx.Close()
+			_ = tty.Close()
+			_ = lg.Close()
+			return nil, err
+		}
+		wrapped := append([]string{"-c", `IFS= read -r _ <&3; exec 3<&-; exec "$@"`, "mu-pty-gate", name}, args...)
+		cmd = exec.Command("/bin/sh", wrapped...)
+		cmd.ExtraFiles = []*os.File{gateR}
+	} else {
+		cmd = exec.Command(name, args...)
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = tty, tty, tty
+	// Setsid + Setctty：子进程新建会话并把 tty（stdin, fd 0）设为受控终端。Linux cgroup v2
+	// 可用时，启动门确保进程在执行目标命令前已进入会话专属 cgroup；进程组 kill 仅作为兼容/兜底。
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true, Setctty: true}
+	if err := cmd.Start(); err != nil {
+		if gateR != nil {
+			_ = gateR.Close()
+		}
+		if gateW != nil {
+			_ = gateW.Close()
+		}
+		_ = cg.close()
+		_ = ptmx.Close()
+		_ = tty.Close()
+		_ = lg.Close()
+		return nil, err
+	}
+	if gateR != nil {
+		_ = gateR.Close()
+	}
+	if cg != nil {
+		if err := cg.attach(cmd.Process.Pid); err != nil {
+			if gateW != nil {
+				_ = gateW.Close()
+			}
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			_ = cg.close()
+			_ = ptmx.Close()
+			_ = tty.Close()
+			_ = lg.Close()
+			return nil, fmt.Errorf("attach PTY process to cgroup: %w", err)
+		}
+		_, _ = gateW.Write([]byte("go\n"))
+		_ = gateW.Close()
+	}
 	_ = tty.Close() // 父进程持有 master 即可，slave 交给子进程
-	p := &ProcSession{cmd: cmd, ptmx: ptmx, log: lg}
+	p := &ProcSession{cmd: cmd, ptmx: ptmx, log: lg, cgroup: cg}
 	go func() {
 		b := make([]byte, 4096)
 		for {
@@ -149,12 +202,15 @@ func (p *ProcSession) FlushInput() error {
 // KillLine 发送 Ctrl-U（NAK 0x15），清掉当前行编辑缓冲里的半行输入。
 func (p *ProcSession) KillLine() { _, _ = p.ptmx.Write([]byte{0x15}) }
 
-// Close 关闭 PTY 并杀掉子进程整组，回收其在会话内启动的 gdb/python 等孙进程，避免遗留。
-// 对 ssh 远端会话：kill 本地 ssh 客户端 + 关 PTY 会令远端 sshd 挂断（SIGHUP），远端前台
-// gdb 随之退出；本地 gdb（local 模式）则由进程组 kill 直接带走。最后 Wait 回收僵尸。
+// Close 关闭 PTY；Linux cgroup v2 可用时先回收会话 cgroup 的完整本地后代树，连 setsid/daemonized
+// 后代也不能逃逸，再保留进程组/direct-child kill 作为兼容兜底。对 ssh 远端会话，关闭本地 ssh + PTY
+// 会令远端 sshd 挂断；远端进程生命周期仍由 ssh 语义决定。最后 Wait 回收顶层子进程。
 func (p *ProcSession) Close() {
 	p.closeOnce.Do(func() {
 		_ = p.ptmx.Close()
+		if p.cgroup != nil {
+			_ = p.cgroup.close()
+		}
 		if p.cmd.Process != nil {
 			pid := p.cmd.Process.Pid
 			// 子进程以 Setpgid 建组，pgid==pid，负号对整组发信号，带走全部孙进程。

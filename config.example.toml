@@ -7,8 +7,8 @@ ssh_opts = "-tt -o LogLevel=error -o StrictHostKeyChecking=no -o UserKnownHostsF
 max_sessions = 2
 
 # Non-interactive job plane: many logical callers share a bounded physical executor.
-# Persistent PTYs remain separately governed by max_sessions.
-# On Linux cgroup v2, each job is descendant-contained in an instance-scoped child cgroup; terminal job states reap the full subtree before capacity is released.
+# Persistent PTYs remain separately governed by max_sessions. On Linux cgroup v2, PTY startup is gated until the shell is attached to a per-session cgroup, so setsid/daemonized descendants are reaped on close/GC/shutdown.
+# Each job is likewise descendant-contained in an instance-scoped child cgroup; terminal job states reap the full subtree before capacity is released.
 # If cgroup v2 is detected but safe containment cannot be prepared, job execution fails closed rather than silently running uncontained.
 job_max_active = 6
 job_max_queued = 128

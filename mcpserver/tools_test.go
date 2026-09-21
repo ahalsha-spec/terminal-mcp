@@ -7,11 +7,13 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/fzxbl/terminal-mcp/internal/audit"
 	"github.com/fzxbl/terminal-mcp/internal/config"
+	"github.com/fzxbl/terminal-mcp/internal/job"
 	"github.com/fzxbl/terminal-mcp/internal/session"
 )
 
@@ -52,10 +54,30 @@ func TestExploreToolSchemaSplit(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list tools: %v", err)
 	}
-	schemas := map[string]string{}
+	inputSchemas := map[string]string{}
+	outputSchemas := map[string]string{}
 	for _, tl := range res.Tools {
 		b, _ := json.Marshal(tl.InputSchema)
-		schemas[tl.Name] = string(b)
+		inputSchemas[tl.Name] = string(b)
+		b, _ = json.Marshal(tl.OutputSchema)
+		outputSchemas[tl.Name] = string(b)
+	}
+	schemas := inputSchemas
+
+	js, ok := inputSchemas["job_submit"]
+	if !ok {
+		t.Fatalf("job_submit not registered; tools=%v", inputSchemas)
+	}
+	for _, f := range []string{"wait_ms", "max_bytes", "async"} {
+		if !strings.Contains(js, `"`+f+`":`) {
+			t.Fatalf("job_submit schema missing %q: %s", f, js)
+		}
+	}
+	jo := outputSchemas["job_submit"]
+	for _, f := range []string{"job_id", "state", "output"} {
+		if !strings.Contains(jo, `"`+f+`":`) {
+			t.Fatalf("job_submit output schema missing backward-compatible/root field %q: %s", f, jo)
+		}
 	}
 
 	jr, ok := schemas["job_result"]
@@ -155,5 +177,50 @@ func TestAuthorizeOwnerUnknownSession(t *testing.T) {
 	session.InitStore(10)
 	if authorizeOwner("alice", "no-such-id") {
 		t.Fatalf("unknown session must not authorize")
+	}
+}
+
+func TestJobSubmitDefaultWaitReturnsOutputInOneCall(t *testing.T) {
+	config.Load("")
+	oldMax := config.Get().MaxBlockSeconds
+	config.Get().MaxBlockSeconds = 2
+	defer func() { config.Get().MaxBlockSeconds = oldMax }()
+	job.Init(job.Config{
+		DataDir: t.TempDir(), MaxActive: 1, MaxQueued: 8, MaxQueuedPerOwner: 8,
+		MaxCPUHeavy: 1, ResultMaxBytes: 4096, DefaultTimeout: time.Second,
+		MaxTimeout: 2 * time.Second, Retention: time.Hour, DisableAdaptive: true,
+	})
+	defer job.Shutdown()
+
+	out, err := submitAndMaybeWait("owner-a", jobSubmitInput{
+		Command: "sleep 0.05; printf one-call-ok", MaxBytes: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.State != "succeeded" || !strings.Contains(out.Output, "one-call-ok") {
+		t.Fatalf("default submit did not return terminal output in one call: %+v", out)
+	}
+}
+
+func TestJobSubmitAsyncRemainsImmediate(t *testing.T) {
+	config.Load("")
+	job.Init(job.Config{
+		DataDir: t.TempDir(), MaxActive: 1, MaxQueued: 8, MaxQueuedPerOwner: 8,
+		MaxCPUHeavy: 1, ResultMaxBytes: 4096, DefaultTimeout: time.Second,
+		MaxTimeout: 2 * time.Second, Retention: time.Hour, DisableAdaptive: true,
+	})
+	defer job.Shutdown()
+
+	start := time.Now()
+	out, err := submitAndMaybeWait("owner-a", jobSubmitInput{Command: "sleep 0.3", Async: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) > 150*time.Millisecond {
+		t.Fatalf("async submit blocked too long: %s", time.Since(start))
+	}
+	if out.JobID == "" || out.State == "succeeded" {
+		t.Fatalf("async submit should return admitted nonterminal snapshot: %+v", out)
 	}
 }
