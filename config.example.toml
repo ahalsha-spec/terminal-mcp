@@ -9,9 +9,9 @@ max_sessions = 2
 # Non-interactive job plane: many logical callers share a bounded physical executor.
 # Persistent PTYs remain separately governed by max_sessions.
 job_max_active = 6
-job_max_queued = 64
-job_max_queued_per_owner = 8
-job_max_batch = 8
+job_max_queued = 128
+job_max_queued_per_owner = 24
+job_max_batch = 24
 job_max_cpu_heavy = 2
 job_result_max_bytes = 65536
 job_default_timeout_seconds = 900

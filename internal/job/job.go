@@ -170,10 +170,10 @@ func normalizeConfig(c Config) Config {
 		c.MaxActive = 4
 	}
 	if c.MaxQueued <= 0 {
-		c.MaxQueued = 64
+		c.MaxQueued = 128
 	}
 	if c.MaxQueuedPerOwner <= 0 {
-		c.MaxQueuedPerOwner = 8
+		c.MaxQueuedPerOwner = 24
 	}
 	if c.MaxQueuedPerOwner > c.MaxQueued {
 		c.MaxQueuedPerOwner = c.MaxQueued

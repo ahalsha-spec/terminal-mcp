@@ -131,16 +131,16 @@ func (c *Config) applyDefaults() {
 		c.JobMaxActive = 6
 	}
 	if c.JobMaxQueued <= 0 {
-		c.JobMaxQueued = 64
+		c.JobMaxQueued = 128
 	}
 	if c.JobMaxQueuedPerOwner <= 0 {
-		c.JobMaxQueuedPerOwner = 8
+		c.JobMaxQueuedPerOwner = 24
 	}
 	if c.JobMaxQueuedPerOwner > c.JobMaxQueued {
 		c.JobMaxQueuedPerOwner = c.JobMaxQueued
 	}
 	if c.JobMaxBatch <= 0 {
-		c.JobMaxBatch = 8
+		c.JobMaxBatch = 24
 	}
 	if c.JobMaxBatch > c.JobMaxQueuedPerOwner {
 		c.JobMaxBatch = c.JobMaxQueuedPerOwner

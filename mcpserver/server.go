@@ -15,10 +15,11 @@ import (
 )
 
 // serverName/serverVersion 为 MCP Implementation 元信息。
-const (
-	serverName    = "terminal-mcp"
-	serverVersion = "v0.1.0"
-)
+const serverName = "terminal-mcp"
+
+// serverVersion is overridden at release build time with -ldflags -X so MCP
+// initialize receipts bind clients to the exact deployed source generation.
+var serverVersion = "v0.9.0-mu.1-dev"
 
 // Init loads config from the given TOML path (empty string = defaults only)
 // and initializes the session store. Must be called before RegisterTools or
