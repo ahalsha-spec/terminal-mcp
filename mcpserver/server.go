@@ -4,11 +4,13 @@ import (
 	"context"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/fzxbl/terminal-mcp/internal/audit"
 	"github.com/fzxbl/terminal-mcp/internal/config"
+	"github.com/fzxbl/terminal-mcp/internal/job"
 	"github.com/fzxbl/terminal-mcp/internal/session"
 )
 
@@ -24,6 +26,14 @@ const (
 func Init(configPath string) {
 	c := config.Load(configPath)
 	session.InitStore(c.MaxSessions)
+	job.Init(job.Config{
+		DataDir: c.DataDir, MaxActive: c.JobMaxActive, MaxQueued: c.JobMaxQueued,
+		MaxQueuedPerOwner: c.JobMaxQueuedPerOwner, MaxCPUHeavy: c.JobMaxCPUHeavy,
+		ResultMaxBytes: c.JobResultMaxBytes,
+		DefaultTimeout: time.Duration(c.JobDefaultTimeoutSec) * time.Second,
+		MaxTimeout:     time.Duration(c.JobMaxTimeoutSec) * time.Second,
+		Retention:      time.Duration(c.JobRetentionMinutes) * time.Minute,
+	})
 	// 应用配置里的静态 peers（供 terminal_list 跨节点聚合与反代白名单）。嵌入宿主如需动态服务发现，
 	// 可在 Init 后调用 SetPeerProvider 覆盖。identity 归属隔离由工具 handler 惰性读配置生效，无需在此处理。
 	setPeers(c.Peers)
@@ -103,4 +113,4 @@ func SetPeerProvider(fn func() []string) { setPeerProvider(fn) }
 func StartIdleGC(ctx context.Context) { session.StartIdleGC(ctx) }
 
 // Shutdown closes all sessions and reclaims child process groups (idempotent).
-func Shutdown() { session.Shutdown() }
+func Shutdown() { job.Shutdown(); session.Shutdown() }

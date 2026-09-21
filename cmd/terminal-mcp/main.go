@@ -11,8 +11,10 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/fzxbl/terminal-mcp/internal/config"
+	"github.com/fzxbl/terminal-mcp/internal/job"
 	"github.com/fzxbl/terminal-mcp/internal/logging"
 	"github.com/fzxbl/terminal-mcp/internal/session"
 	"github.com/fzxbl/terminal-mcp/mcpserver"
@@ -28,6 +30,14 @@ func main() {
 		c.ListenAddr = *listen
 	}
 	session.InitStore(c.MaxSessions)
+	job.Init(job.Config{
+		DataDir: c.DataDir, MaxActive: c.JobMaxActive, MaxQueued: c.JobMaxQueued,
+		MaxQueuedPerOwner: c.JobMaxQueuedPerOwner, MaxCPUHeavy: c.JobMaxCPUHeavy,
+		ResultMaxBytes: c.JobResultMaxBytes,
+		DefaultTimeout: time.Duration(c.JobDefaultTimeoutSec) * time.Second,
+		MaxTimeout:     time.Duration(c.JobMaxTimeoutSec) * time.Second,
+		Retention:      time.Duration(c.JobRetentionMinutes) * time.Minute,
+	})
 
 	// 分布式：进程自动探测本机可达地址作为 session_id 的属主 token，无需每实例配不同地址
 	// （通配监听 0.0.0.0 会被解析为本机实际 IP）。跨 NAT/需对外映射时用 SetSelfAddr 覆盖。
@@ -68,6 +78,7 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	<-sig
 	cancel()
+	job.Shutdown()
 	session.Shutdown()
 	_ = srv.Close()
 }

@@ -10,6 +10,12 @@ func TestDefaults(t *testing.T) {
 	if c.MaxSessions != 2 {
 		t.Fatalf("MaxSessions default = %d, want 2", c.MaxSessions)
 	}
+	if c.JobMaxActive != 4 || c.JobMaxQueued != 64 || c.JobMaxQueuedPerOwner != 8 || c.JobMaxCPUHeavy != 2 {
+		t.Fatalf("job defaults unexpected: active=%d queued=%d perOwner=%d cpu=%d", c.JobMaxActive, c.JobMaxQueued, c.JobMaxQueuedPerOwner, c.JobMaxCPUHeavy)
+	}
+	if c.JobResultMaxBytes != 64<<10 || c.JobDefaultTimeoutSec != 900 || c.JobMaxTimeoutSec != 3600 || c.JobRetentionMinutes != 60 {
+		t.Fatalf("job output/lifecycle defaults unexpected: bytes=%d defaultTimeout=%d maxTimeout=%d retention=%d", c.JobResultMaxBytes, c.JobDefaultTimeoutSec, c.JobMaxTimeoutSec, c.JobRetentionMinutes)
+	}
 	if c.DefaultShell != "bash" {
 		t.Fatalf("DefaultShell default = %q, want bash", c.DefaultShell)
 	}

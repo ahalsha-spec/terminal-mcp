@@ -13,6 +13,14 @@ type Config struct {
 	SSHUser                 string `toml:"ssh_user"`
 	DefaultShell            string `toml:"default_shell"`
 	MaxSessions             int    `toml:"max_sessions"`
+	JobMaxActive            int    `toml:"job_max_active"`
+	JobMaxQueued            int    `toml:"job_max_queued"`
+	JobMaxQueuedPerOwner    int    `toml:"job_max_queued_per_owner"`
+	JobMaxCPUHeavy          int    `toml:"job_max_cpu_heavy"`
+	JobResultMaxBytes       int64  `toml:"job_result_max_bytes"`
+	JobDefaultTimeoutSec    int    `toml:"job_default_timeout_seconds"`
+	JobMaxTimeoutSec        int    `toml:"job_max_timeout_seconds"`
+	JobRetentionMinutes     int    `toml:"job_retention_minutes"`
 	IdleTTLMinutes          int    `toml:"idle_ttl_minutes"`
 	PressureReapIdleSeconds int    `toml:"pressure_reap_idle_seconds"`
 	ExecOutputMaxBytes      int64  `toml:"exec_output_max_bytes"`
@@ -116,6 +124,39 @@ func (c *Config) applyDefaults() {
 	}
 	if c.MaxSessions <= 0 {
 		c.MaxSessions = 2
+	}
+	if c.JobMaxActive <= 0 {
+		c.JobMaxActive = 4
+	}
+	if c.JobMaxQueued <= 0 {
+		c.JobMaxQueued = 64
+	}
+	if c.JobMaxQueuedPerOwner <= 0 {
+		c.JobMaxQueuedPerOwner = 8
+	}
+	if c.JobMaxQueuedPerOwner > c.JobMaxQueued {
+		c.JobMaxQueuedPerOwner = c.JobMaxQueued
+	}
+	if c.JobMaxCPUHeavy <= 0 {
+		c.JobMaxCPUHeavy = 2
+	}
+	if c.JobMaxCPUHeavy > c.JobMaxActive {
+		c.JobMaxCPUHeavy = c.JobMaxActive
+	}
+	if c.JobResultMaxBytes <= 0 {
+		c.JobResultMaxBytes = 64 << 10
+	}
+	if c.JobDefaultTimeoutSec <= 0 {
+		c.JobDefaultTimeoutSec = 900
+	}
+	if c.JobMaxTimeoutSec <= 0 {
+		c.JobMaxTimeoutSec = 3600
+	}
+	if c.JobDefaultTimeoutSec > c.JobMaxTimeoutSec {
+		c.JobDefaultTimeoutSec = c.JobMaxTimeoutSec
+	}
+	if c.JobRetentionMinutes <= 0 {
+		c.JobRetentionMinutes = 60
 	}
 	if c.IdleTTLMinutes <= 0 {
 		c.IdleTTLMinutes = 30

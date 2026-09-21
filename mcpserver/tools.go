@@ -7,12 +7,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/fzxbl/terminal-mcp/internal/audit"
 	"github.com/fzxbl/terminal-mcp/internal/config"
 	"github.com/fzxbl/terminal-mcp/internal/identity"
+	"github.com/fzxbl/terminal-mcp/internal/job"
 	"github.com/fzxbl/terminal-mcp/internal/session"
 )
 
@@ -50,6 +52,23 @@ type exploreInput struct {
 	MaxBytes   int    `json:"max_bytes,omitempty" jsonschema:"desired max body bytes (clamped to server hard cap)"`
 }
 
+type jobSubmitInput struct {
+	Command        string `json:"command" jsonschema:"non-interactive command to execute through the bounded job scheduler"`
+	Cwd            string `json:"cwd,omitempty" jsonschema:"optional working directory"`
+	Class          string `json:"class,omitempty" jsonschema:"normal | cpu_heavy | io_wait | background"`
+	SupersedeKey   string `json:"supersede_key,omitempty" jsonschema:"optional logical key; newer jobs from this caller cancel older queued/running jobs with the same key"`
+	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to its configured maximum"`
+}
+
+type jobIDInput struct {
+	JobID string `json:"job_id" jsonschema:"the job id returned by job_submit"`
+}
+
+type jobResultInput struct {
+	JobID    string `json:"job_id" jsonschema:"the job id returned by job_submit"`
+	MaxBytes int64  `json:"max_bytes,omitempty" jsonschema:"maximum tail bytes to return; clamped by the server"`
+}
+
 type controlInput struct {
 	SessionID string `json:"session_id" jsonschema:"the session id"`
 	Key       string `json:"key" jsonschema:"control key or recovery action. Control keys (written to the PTY as the corresponding control byte): ctrl-c (SIGINT, interrupt the running command), ctrl-d (EOF, end input / exit a REPL or shell), ctrl-z (SIGTSTP, suspend to background), ctrl-\\ (SIGQUIT, quit with core), ctrl-l (clear screen), ctrl-u (erase to line start), ctrl-k (erase to line end), ctrl-a (move to line start), ctrl-e (move to line end), ctrl-w (erase previous word), ctrl-r (reverse history search), ctrl-g (bell / cancel current edit or search), tab (completion), esc (Escape), enter (Enter), backspace. Recovery actions: flush (drop queued input + clear the current line + Enter), hard (reopen the shell), rearm (re-inject the sentinel prompt after you switched into a new shell, e.g. after su/docker exec/chroot, if the session appears stuck)."`
@@ -66,6 +85,11 @@ type capacityOutput struct {
 	Used      int `json:"used" jsonschema:"local admission slots currently occupied after dead-session reconciliation"`
 	Max       int `json:"max" jsonschema:"configured local admission limit"`
 	Available int `json:"available" jsonschema:"local admission slots currently available"`
+}
+
+type jobListOutput struct {
+	Jobs     []job.Snapshot `json:"jobs" jsonschema:"jobs owned by this caller"`
+	Capacity job.Capacity   `json:"capacity" jsonschema:"global bounded job-plane capacity"`
 }
 
 type listOutput struct {
@@ -112,6 +136,14 @@ const (
 		"held=true means a human has taken over: the model should pause write operations and only read until held becomes false; " +
 		"use terminal_output(mode=since_last) to see what the human executed."
 
+	descJobSubmit = "Submit bounded non-interactive machine work without consuming a persistent PTY. " +
+		"Prefer this for tests, builds, searches, file transforms and deterministic scripts. The scheduler admits many logical callers but bounds physical execution, applies per-caller/global queue limits, and round-robins across callers. " +
+		"Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. supersede_key lets newer work cancel stale work with the same logical purpose."
+	descJobStatus = "Read one job's state. Use for genuinely asynchronous work; do not rapid-poll."
+	descJobResult = "Read a bounded tail of a job's disk-backed output. Large output stays local; max_bytes is clamped by the server."
+	descJobCancel = "Cancel queued or running work owned by this caller. Running process groups are terminated; use when work becomes stale or is superseded."
+	descJobList   = "List this caller's jobs plus global scheduler capacity: active/max_active, queued/max_queued, and cpu_heavy_active/max_cpu_heavy."
+
 	descClose = "Close the session, releasing its child process and concurrency slot. " +
 		"If held=true the session is under human takeover: this call was NOT executed; wait until held clears."
 
@@ -121,6 +153,11 @@ const (
 
 // defaultDescriptions 各工具的内置默认描述，供 resolveDesc 在无覆盖时回退。
 var defaultDescriptions = map[string]string{
+	"job_submit":       descJobSubmit,
+	"job_status":       descJobStatus,
+	"job_result":       descJobResult,
+	"job_cancel":       descJobCancel,
+	"job_list":         descJobList,
 	"terminal_open":    descOpen,
 	"terminal_send":    descSend,
 	"terminal_output":  descOutput,
@@ -170,6 +207,93 @@ func resolveDesc(name string) string {
 // 每个 handler 计算结果后调用 audit.Logger 记录一条审计。CallerIP 从 HTTP 请求头解析
 // （官方 SDK 通过 CallToolRequest.Extra.Header 把 HTTP header 透传给每个工具 handler）。
 func registerTools(server *mcp.Server, a *audit.Logger) {
+	mcp.AddTool(server, &mcp.Tool{Name: "job_submit", Description: resolveDesc("job_submit")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobSubmitInput) (*mcp.CallToolResult, job.Snapshot, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, job.Snapshot{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			snap, err := job.Submit(owner, job.SubmitArgs{
+				Command: in.Command, Cwd: in.Cwd, Class: in.Class, SupersedeKey: in.SupersedeKey,
+				Timeout: time.Duration(in.TimeoutSeconds) * time.Second,
+			})
+			e := baseEntry(req, "job_submit", map[string]any{
+				"class": in.Class, "cwd": in.Cwd, "supersede_key": in.SupersedeKey, "timeout_seconds": in.TimeoutSeconds,
+			})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = snap.State
+			}
+			a.Log(e)
+			return nil, snap, err
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_status", Description: resolveDesc("job_status")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobIDInput) (*mcp.CallToolResult, job.Snapshot, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, job.Snapshot{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			snap, err := job.Status(owner, in.JobID)
+			e := baseEntry(req, "job_status", map[string]any{"job_id": in.JobID})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = snap.State
+			}
+			a.Log(e)
+			return nil, snap, err
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_result", Description: resolveDesc("job_result")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobResultInput) (*mcp.CallToolResult, job.Result, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, job.Result{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			res, err := job.ResultFor(owner, in.JobID, in.MaxBytes)
+			e := baseEntry(req, "job_result", map[string]any{"job_id": in.JobID, "max_bytes": in.MaxBytes})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = res.Snapshot.State
+				e.Bytes = len(res.Output)
+			}
+			a.Log(e)
+			return nil, res, err
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_cancel", Description: resolveDesc("job_cancel")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobIDInput) (*mcp.CallToolResult, job.Snapshot, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, job.Snapshot{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			snap, err := job.Cancel(owner, in.JobID)
+			e := baseEntry(req, "job_cancel", map[string]any{"job_id": in.JobID})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = snap.State
+			}
+			a.Log(e)
+			return nil, snap, err
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_list", Description: resolveDesc("job_list")},
+		func(_ context.Context, req *mcp.CallToolRequest, _ emptyInput) (*mcp.CallToolResult, jobListOutput, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, jobListOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			jobs, capacity := job.List(owner)
+			e := baseEntry(req, "job_list", nil)
+			e.State = "ok"
+			a.Log(e)
+			return nil, jobListOutput{Jobs: jobs, Capacity: capacity}, nil
+		})
+
 	mcp.AddTool(server, &mcp.Tool{Name: "terminal_open", Description: resolveDesc("terminal_open")},
 		func(_ context.Context, req *mcp.CallToolRequest, in openInput) (*mcp.CallToolResult, map[string]string, error) {
 			owner, ok := ownerSig(req)
