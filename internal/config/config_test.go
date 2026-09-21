@@ -10,7 +10,7 @@ func TestDefaults(t *testing.T) {
 	if c.MaxSessions != 2 {
 		t.Fatalf("MaxSessions default = %d, want 2", c.MaxSessions)
 	}
-	if c.JobMaxActive != 4 || c.JobMaxQueued != 64 || c.JobMaxQueuedPerOwner != 8 || c.JobMaxCPUHeavy != 2 {
+	if c.JobMaxActive != 6 || c.JobMaxQueued != 64 || c.JobMaxQueuedPerOwner != 8 || c.JobMaxBatch != 8 || c.JobMaxCPUHeavy != 2 {
 		t.Fatalf("job defaults unexpected: active=%d queued=%d perOwner=%d cpu=%d", c.JobMaxActive, c.JobMaxQueued, c.JobMaxQueuedPerOwner, c.JobMaxCPUHeavy)
 	}
 	if c.JobResultMaxBytes != 64<<10 || c.JobDefaultTimeoutSec != 900 || c.JobMaxTimeoutSec != 3600 || c.JobRetentionMinutes != 60 {

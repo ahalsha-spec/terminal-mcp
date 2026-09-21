@@ -257,3 +257,42 @@ func TestFiftyLogicalProducersStayPhysicallyBounded(t *testing.T) {
 	}
 	t.Fatalf("50-producer workload did not drain; peak active=%d cpu=%d", peakActive, peakCPU)
 }
+
+func TestAdaptivePressurePolicy(t *testing.T) {
+	base := Pressure{
+		EffectiveCPU:         3,
+		MemoryTotalBytes:     8 << 30,
+		MemoryAvailableBytes: 5 << 30,
+	}
+	if got := targetForPressure(6, base); got != 5 {
+		t.Fatalf("low-pressure target=%d, want 5", got)
+	}
+
+	cpuHot := base
+	cpuHot.CPUSomeAvg10 = 75
+	if got := targetForPressure(6, cpuHot); got != 1 {
+		t.Fatalf("high-CPU target=%d, want 1", got)
+	}
+
+	memTight := base
+	memTight.MemoryAvailableBytes = 1 << 30
+	if got := targetForPressure(6, memTight); got != 2 {
+		t.Fatalf("memory-tight target=%d, want 2", got)
+	}
+
+	ioHot := base
+	ioHot.IOFullAvg10 = 25
+	if got := targetForPressure(6, ioHot); got != 3 {
+		t.Fatalf("I/O-pressure target=%d, want 3", got)
+	}
+
+	bgOK := base
+	if !classAllowedByPressure(ClassBackground, bgOK) {
+		t.Fatal("background should be allowed under low pressure")
+	}
+	bgHot := base
+	bgHot.IOFullAvg10 = 15
+	if classAllowedByPressure(ClassBackground, bgHot) {
+		t.Fatal("background should yield under I/O pressure")
+	}
+}

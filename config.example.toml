@@ -8,14 +8,16 @@ max_sessions = 2
 
 # Non-interactive job plane: many logical callers share a bounded physical executor.
 # Persistent PTYs remain separately governed by max_sessions.
-job_max_active = 4
+job_max_active = 6
 job_max_queued = 64
 job_max_queued_per_owner = 8
+job_max_batch = 8
 job_max_cpu_heavy = 2
 job_result_max_bytes = 65536
 job_default_timeout_seconds = 900
 job_max_timeout_seconds = 3600
 job_retention_minutes = 60
+job_disable_adaptive = false
 idle_ttl_minutes = 30
 max_block_seconds = 30
 transcript_retention_days = 7
@@ -91,7 +93,7 @@ disable_local_mode = false
 
 # 工具描述覆盖：按工具名改写对外暴露给模型的 MCP 工具说明（集成到外部 MCP、需按自家话术改写时用）。
 # 缺省或留空的工具沿用内置默认描述。key 取以下工具名之一：
-#   job_submit / job_status / job_result / job_cancel / job_list /
+#   job_submit / job_batch_submit / job_status / job_result / job_cancel / job_list /
 #   terminal_open / terminal_send / terminal_output / terminal_control /
 #   terminal_status / terminal_close / terminal_list / terminal_explore
 # [tool_descriptions]

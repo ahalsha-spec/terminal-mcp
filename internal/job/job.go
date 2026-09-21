@@ -34,6 +34,7 @@ type Config struct {
 	DefaultTimeout    time.Duration
 	MaxTimeout        time.Duration
 	Retention         time.Duration
+	DisableAdaptive   bool
 }
 
 type SubmitArgs struct {
@@ -67,12 +68,19 @@ type Result struct {
 }
 
 type Capacity struct {
-	Active      int
-	MaxActive   int
-	Queued      int
-	MaxQueued   int
-	CPUHeavy    int
-	MaxCPUHeavy int
+	Active            int
+	MaxActive         int
+	Queued            int
+	MaxQueued         int
+	CPUHeavy          int
+	MaxCPUHeavy       int
+	AdaptiveMaxActive int
+	Adaptive          bool
+	EffectiveCPU      int
+	CPUSomeAvg10      float64
+	MemorySomeAvg10   float64
+	IOFullAvg10       float64
+	MemoryAvailableMB uint64
 }
 
 type Job struct {
@@ -128,6 +136,8 @@ type store struct {
 	owners         []string
 	active         int
 	activeCPUHeavy int
+	adaptiveMax    int
+	pressure       Pressure
 	lastOwner      string
 	closed         bool
 	stop           chan struct{}
@@ -187,6 +197,12 @@ func Init(c Config) {
 		stop:   make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
+	if c.DisableAdaptive {
+		s.adaptiveMax = c.MaxActive
+	} else {
+		s.pressure = readPressure()
+		s.adaptiveMax = targetForPressure(c.MaxActive, s.pressure)
+	}
 
 	globalMu.Lock()
 	old := theStore
@@ -199,6 +215,9 @@ func Init(c Config) {
 	_ = os.MkdirAll(filepath.Join(c.DataDir, "jobs"), 0o700)
 	go s.dispatch()
 	go s.gcLoop()
+	if !c.DisableAdaptive {
+		go s.pressureLoop()
+	}
 }
 
 func current() *store {
@@ -343,7 +362,11 @@ func (s *store) removeQueuedLocked(target *Job) {
 }
 
 func (s *store) nextRunnableLocked() *Job {
-	if s.active >= s.cfg.MaxActive || len(s.owners) == 0 {
+	limit := s.adaptiveMax
+	if limit <= 0 || limit > s.cfg.MaxActive {
+		limit = s.cfg.MaxActive
+	}
+	if s.active >= limit || len(s.owners) == 0 {
 		return nil
 	}
 
@@ -361,20 +384,24 @@ func (s *store) nextRunnableLocked() *Job {
 		idx := (start + step) % len(s.owners)
 		owner := s.owners[idx]
 		q := s.queues[owner]
-		for len(q) > 0 {
-			j := q[0]
+		for pos := 0; pos < len(q); pos++ {
+			j := q[pos]
 			j.mu.Lock()
 			state, class := j.State, j.Class
 			j.mu.Unlock()
 			if state != "queued" {
-				q = q[1:]
+				q = append(q[:pos], q[pos+1:]...)
 				s.queues[owner] = q
+				pos--
 				continue
 			}
 			if class == ClassCPUHeavy && s.activeCPUHeavy >= s.cfg.MaxCPUHeavy {
-				break
+				continue
 			}
-			s.queues[owner] = q[1:]
+			if !s.cfg.DisableAdaptive && !classAllowedByPressure(class, s.pressure) {
+				continue
+			}
+			s.queues[owner] = append(q[:pos], q[pos+1:]...)
 			s.lastOwner = owner
 			s.active++
 			if class == ClassCPUHeavy {
@@ -602,6 +629,10 @@ func List(owner string) ([]Snapshot, Capacity) {
 		Active: s.active, MaxActive: s.cfg.MaxActive,
 		Queued: s.queuedCountLocked(), MaxQueued: s.cfg.MaxQueued,
 		CPUHeavy: s.activeCPUHeavy, MaxCPUHeavy: s.cfg.MaxCPUHeavy,
+		AdaptiveMaxActive: s.adaptiveMax, Adaptive: !s.cfg.DisableAdaptive,
+		EffectiveCPU: s.pressure.EffectiveCPU,
+		CPUSomeAvg10: s.pressure.CPUSomeAvg10, MemorySomeAvg10: s.pressure.MemorySomeAvg10,
+		IOFullAvg10: s.pressure.IOFullAvg10, MemoryAvailableMB: s.pressure.MemoryAvailableBytes >> 20,
 	}
 	s.mu.Unlock()
 

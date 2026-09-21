@@ -16,11 +16,13 @@ type Config struct {
 	JobMaxActive            int    `toml:"job_max_active"`
 	JobMaxQueued            int    `toml:"job_max_queued"`
 	JobMaxQueuedPerOwner    int    `toml:"job_max_queued_per_owner"`
+	JobMaxBatch             int    `toml:"job_max_batch"`
 	JobMaxCPUHeavy          int    `toml:"job_max_cpu_heavy"`
 	JobResultMaxBytes       int64  `toml:"job_result_max_bytes"`
 	JobDefaultTimeoutSec    int    `toml:"job_default_timeout_seconds"`
 	JobMaxTimeoutSec        int    `toml:"job_max_timeout_seconds"`
 	JobRetentionMinutes     int    `toml:"job_retention_minutes"`
+	JobDisableAdaptive      bool   `toml:"job_disable_adaptive"`
 	IdleTTLMinutes          int    `toml:"idle_ttl_minutes"`
 	PressureReapIdleSeconds int    `toml:"pressure_reap_idle_seconds"`
 	ExecOutputMaxBytes      int64  `toml:"exec_output_max_bytes"`
@@ -126,7 +128,7 @@ func (c *Config) applyDefaults() {
 		c.MaxSessions = 2
 	}
 	if c.JobMaxActive <= 0 {
-		c.JobMaxActive = 4
+		c.JobMaxActive = 6
 	}
 	if c.JobMaxQueued <= 0 {
 		c.JobMaxQueued = 64
@@ -136,6 +138,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.JobMaxQueuedPerOwner > c.JobMaxQueued {
 		c.JobMaxQueuedPerOwner = c.JobMaxQueued
+	}
+	if c.JobMaxBatch <= 0 {
+		c.JobMaxBatch = 8
+	}
+	if c.JobMaxBatch > c.JobMaxQueuedPerOwner {
+		c.JobMaxBatch = c.JobMaxQueuedPerOwner
 	}
 	if c.JobMaxCPUHeavy <= 0 {
 		c.JobMaxCPUHeavy = 2

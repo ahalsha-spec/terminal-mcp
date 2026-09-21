@@ -33,10 +33,11 @@ func main() {
 	job.Init(job.Config{
 		DataDir: c.DataDir, MaxActive: c.JobMaxActive, MaxQueued: c.JobMaxQueued,
 		MaxQueuedPerOwner: c.JobMaxQueuedPerOwner, MaxCPUHeavy: c.JobMaxCPUHeavy,
-		ResultMaxBytes: c.JobResultMaxBytes,
-		DefaultTimeout: time.Duration(c.JobDefaultTimeoutSec) * time.Second,
-		MaxTimeout:     time.Duration(c.JobMaxTimeoutSec) * time.Second,
-		Retention:      time.Duration(c.JobRetentionMinutes) * time.Minute,
+		ResultMaxBytes:  c.JobResultMaxBytes,
+		DefaultTimeout:  time.Duration(c.JobDefaultTimeoutSec) * time.Second,
+		MaxTimeout:      time.Duration(c.JobMaxTimeoutSec) * time.Second,
+		Retention:       time.Duration(c.JobRetentionMinutes) * time.Minute,
+		DisableAdaptive: c.JobDisableAdaptive,
 	})
 
 	// 分布式：进程自动探测本机可达地址作为 session_id 的属主 token，无需每实例配不同地址

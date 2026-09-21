@@ -29,10 +29,11 @@ func Init(configPath string) {
 	job.Init(job.Config{
 		DataDir: c.DataDir, MaxActive: c.JobMaxActive, MaxQueued: c.JobMaxQueued,
 		MaxQueuedPerOwner: c.JobMaxQueuedPerOwner, MaxCPUHeavy: c.JobMaxCPUHeavy,
-		ResultMaxBytes: c.JobResultMaxBytes,
-		DefaultTimeout: time.Duration(c.JobDefaultTimeoutSec) * time.Second,
-		MaxTimeout:     time.Duration(c.JobMaxTimeoutSec) * time.Second,
-		Retention:      time.Duration(c.JobRetentionMinutes) * time.Minute,
+		ResultMaxBytes:  c.JobResultMaxBytes,
+		DefaultTimeout:  time.Duration(c.JobDefaultTimeoutSec) * time.Second,
+		MaxTimeout:      time.Duration(c.JobMaxTimeoutSec) * time.Second,
+		Retention:       time.Duration(c.JobRetentionMinutes) * time.Minute,
+		DisableAdaptive: c.JobDisableAdaptive,
 	})
 	// 应用配置里的静态 peers（供 terminal_list 跨节点聚合与反代白名单）。嵌入宿主如需动态服务发现，
 	// 可在 Init 后调用 SetPeerProvider 覆盖。identity 归属隔离由工具 handler 惰性读配置生效，无需在此处理。
