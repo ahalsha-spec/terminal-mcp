@@ -65,6 +65,8 @@ type Snapshot struct {
 	Error           string   `json:"error,omitempty"`
 	OutputBytes     int64    `json:"output_bytes,omitempty"`
 	CancelRequested bool     `json:"cancel_requested,omitempty"`
+	Observed        bool     `json:"observed"`
+	ObservedAt      string   `json:"observed_at,omitempty"`
 }
 
 type Result struct {
@@ -114,6 +116,7 @@ type Job struct {
 	OutputBytes     int64
 	Timeout         time.Duration
 	CancelRequested bool
+	ObservedAt      time.Time
 	cancel          context.CancelFunc
 	proc            *os.Process
 }
@@ -138,6 +141,10 @@ func (j *Job) snapshotLocked() Snapshot {
 	}
 	if !j.FinishedAt.IsZero() {
 		s.FinishedAt = j.FinishedAt.UTC().Format(time.RFC3339Nano)
+	}
+	if !j.ObservedAt.IsZero() {
+		s.Observed = true
+		s.ObservedAt = j.ObservedAt.UTC().Format(time.RFC3339Nano)
 	}
 	return s
 }
@@ -979,6 +986,41 @@ func List(owner string) ([]Snapshot, Capacity) {
 	return out, capacity
 }
 
+func markObservedResult(j *Job, res Result) Result {
+	j.mu.Lock()
+	if isTerminalState(j.State) {
+		if j.ObservedAt.IsZero() {
+			j.ObservedAt = time.Now()
+		}
+		res.Snapshot = j.snapshotLocked()
+	}
+	j.mu.Unlock()
+	return res
+}
+
+func UnobservedTerminalCount(owner string) int {
+	s := current()
+	if s == nil {
+		return 0
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, j := range s.jobs {
+		if j.Owner != owner {
+			continue
+		}
+		j.mu.Lock()
+		terminal := isTerminalState(j.State)
+		observed := !j.ObservedAt.IsZero()
+		j.mu.Unlock()
+		if terminal && !observed {
+			n++
+		}
+	}
+	return n
+}
+
 func ResultFor(owner, id string, maxBytes int64) (Result, error) {
 	s := current()
 	if s == nil {
@@ -999,7 +1041,7 @@ func ResultFor(owner, id string, maxBytes int64) (Result, error) {
 	f, err := os.Open(j.OutputPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Result{Snapshot: snap}, nil
+			return markObservedResult(j, Result{Snapshot: snap}), nil
 		}
 		return Result{}, err
 	}
@@ -1022,7 +1064,7 @@ func ResultFor(owner, id string, maxBytes int64) (Result, error) {
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{Snapshot: snap, Output: string(b), Truncated: truncated}, nil
+	return markObservedResult(j, Result{Snapshot: snap, Output: string(b), Truncated: truncated}), nil
 }
 
 // ResultForWait waits up to wait for the job to reach a terminal state, then

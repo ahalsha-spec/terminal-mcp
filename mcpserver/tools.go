@@ -78,7 +78,10 @@ type jobBatchItemInput struct {
 }
 
 type jobBatchInput struct {
-	Items []jobBatchItemInput `json:"items" jsonschema:"independent jobs to admit in one call; bounded by job_max_batch and normal queue limits"`
+	Items          []jobBatchItemInput `json:"items" jsonschema:"independent jobs to admit in one call; bounded by job_max_batch and normal queue limits"`
+	Async          bool                `json:"async,omitempty" jsonschema:"set true only for immediate admission; otherwise the batch stays attached under one bounded shared wait horizon"`
+	WaitMs         int                 `json:"wait_ms,omitempty" jsonschema:"shared bounded milliseconds to wait for admitted jobs; default 30000 and capped by max_block_seconds"`
+	MaxBytesPerJob int64               `json:"max_bytes_per_job,omitempty" jsonschema:"maximum output tail bytes per returned job; additionally bounded by the aggregate response budget"`
 }
 
 type jobSubmitOutput struct {
@@ -99,20 +102,33 @@ type jobGraphNodeInput struct {
 }
 
 type jobGraphInput struct {
-	GraphKey string              `json:"graph_key,omitempty" jsonschema:"optional idempotency key for the entire graph; identical replay returns existing job handles"`
-	Nodes    []jobGraphNodeInput `json:"nodes" jsonschema:"named DAG nodes; bounded by job_max_batch"`
+	GraphKey       string              `json:"graph_key,omitempty" jsonschema:"optional idempotency key for the entire graph; identical replay returns existing job handles"`
+	Nodes          []jobGraphNodeInput `json:"nodes" jsonschema:"named DAG nodes; bounded by job_max_batch"`
+	Async          bool                `json:"async,omitempty" jsonschema:"set true only for immediate graph admission; otherwise wait boundedly for node outcomes"`
+	WaitMs         int                 `json:"wait_ms,omitempty" jsonschema:"shared bounded milliseconds to wait for graph nodes; default 30000 and capped by max_block_seconds"`
+	MaxBytesPerJob int64               `json:"max_bytes_per_job,omitempty" jsonschema:"maximum output tail bytes per returned node; additionally bounded by the aggregate response budget"`
 }
 
 type jobBatchItemOutput struct {
-	Index int           `json:"index"`
-	Job   *job.Snapshot `json:"job,omitempty"`
-	Error string        `json:"error,omitempty"`
+	Index     int           `json:"index"`
+	Job       *job.Snapshot `json:"job,omitempty"`
+	Output    string        `json:"output,omitempty"`
+	Truncated bool          `json:"truncated,omitempty"`
+	Error     string        `json:"error,omitempty"`
 }
 
 type jobBatchOutput struct {
-	Results  []jobBatchItemOutput `json:"results"`
-	Accepted int                  `json:"accepted"`
-	Rejected int                  `json:"rejected"`
+	Results                 []jobBatchItemOutput `json:"results"`
+	Accepted                int                  `json:"accepted"`
+	Rejected                int                  `json:"rejected"`
+	TerminalCount           int                  `json:"terminal_count"`
+	PendingCount            int                  `json:"pending_count"`
+	FailedCount             int                  `json:"failed_count"`
+	ReadbackErrorCount      int                  `json:"readback_error_count,omitempty"`
+	UnobservedTerminalCount int                  `json:"unobserved_terminal_count"`
+	AllTerminal             bool                 `json:"all_terminal"`
+	FollowupRequired        bool                 `json:"followup_required"`
+	PendingJobIDs           []string             `json:"pending_job_ids,omitempty"`
 }
 
 type jobIDInput struct {
@@ -144,8 +160,9 @@ type capacityOutput struct {
 }
 
 type jobListOutput struct {
-	Jobs     []job.Snapshot `json:"jobs" jsonschema:"jobs owned by this caller"`
-	Capacity job.Capacity   `json:"capacity" jsonschema:"global bounded job-plane capacity"`
+	Jobs                    []job.Snapshot `json:"jobs" jsonschema:"jobs owned by this caller"`
+	Capacity                job.Capacity   `json:"capacity" jsonschema:"global bounded job-plane capacity"`
+	UnobservedTerminalCount int            `json:"unobserved_terminal_count" jsonschema:"caller-owned terminal jobs whose result has not yet been returned through a result-bearing tool"`
 }
 
 type listOutput struct {
@@ -196,18 +213,20 @@ const (
 		"Prefer this single-call path for normal tests, builds, searches, file transforms and deterministic scripts; set async=true only when immediate asynchronous admission is genuinely required. wait_ms is capped by max_block_seconds and max_bytes bounds returned output. " +
 		"The scheduler still bounds physical execution, applies per-caller/global queue limits, and round-robins across callers. Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. " +
 		"supersede_key cancels stale same-purpose work; idempotency_key deduplicates exact retries and rejects changed payloads; depends_on gates execution on prior successful jobs; lock_keys serialize conflicting resources."
-	descJobBatchSubmit = "Submit a bounded batch of non-interactive jobs in one MCP call. " +
-		"Use this instead of many serial tool calls when work is separable. Each item supports idempotency, existing-job dependencies and lock keys. " +
-		"Admission remains subject to the same global/per-caller queue limits and adaptive physical scheduler; each item reports accepted or rejected explicitly."
-	descJobGraphSubmit = "Submit a bounded named dependency DAG in one MCP call. " +
-		"Independent nodes may run concurrently; depends_on edges serialize only true prerequisites; lock_keys prevent conflicting resource overlap. " +
-		"The graph is validated and queue-admitted atomically, so cycles or capacity failures leave no partial graph. graph_key makes exact retries idempotent and rejects changed definitions."
+	descJobBatchSubmit = "Submit a bounded batch of non-interactive jobs, then by default stay attached under one shared bounded wait horizon and return terminal results plus bounded output in this same MCP call. " +
+		"Independent jobs remain physically concurrent; queued/running means pending, not complete. Set async=true only when immediate admission is genuinely required; async admission makes the caller responsible for later observation via job_drain/job_result. " +
+		"Normal audits, tests, builds and separable searches should prefer the attached default. Admission remains subject to existing queue, ownership, idempotency, dependency, lock and pressure rules."
+	descJobGraphSubmit = "Submit a bounded named dependency DAG, then by default stay attached under one shared bounded wait horizon and return node outcomes plus bounded output in this same MCP call. " +
+		"Independent nodes may run concurrently while depends_on and lock_keys preserve lawful ordering; queued/running means pending, not complete. Set async=true only for genuine admission-only workflows, which then own later observation via job_drain/job_result. " +
+		"Graph validation/admission, graph_key idempotency, dependency failure propagation and the incumbent scheduler remain authoritative."
+	descJobDrain = "Recover caller-owned job observation debt without chat-memory archaeology. Omit job_ids to discover and drain this caller's outstanding unobserved work under one bounded wait horizon; supply job_ids to reread those caller-owned results deterministically even if already observed. " +
+		"Terminal results returned here are marked observed only after bounded result construction; queued/running jobs remain explicit pending work. This does not change execution truth or delete disk-backed output."
 	descJobStatus = "Read one job's state immediately without waiting. Use this when you explicitly need a non-blocking snapshot."
 	descJobResult = "Wait boundedly for a job to reach a terminal state, then read a bounded tail of its disk-backed output. " +
 		"wait_ms defaults to 30000 and is capped by server max_block_seconds; if the bound expires first, the current queued/running snapshot is returned so the caller can do other work instead of rapid-polling. " +
 		"Large output stays local; max_bytes is clamped by the server. Prefer this over repeated job_status/job_result polling when waiting for normal job completion."
 	descJobCancel = "Cancel queued or running work owned by this caller. Running process groups are terminated; use when work becomes stale or is superseded."
-	descJobList   = "List this caller's jobs plus global scheduler capacity: active/max_active, queued/max_queued, and cpu_heavy_active/max_cpu_heavy."
+	descJobList   = "List this caller's jobs plus global scheduler capacity and unobserved_terminal_count. Status/list inspection never consumes terminal output; use job_drain or job_result for result observation."
 
 	descClose = "Close the session, releasing its child process and concurrency slot. " +
 		"If held=true the session is under human takeover: this call was NOT executed; wait until held clears."
@@ -221,6 +240,7 @@ var defaultDescriptions = map[string]string{
 	"job_submit":       descJobSubmit,
 	"job_batch_submit": descJobBatchSubmit,
 	"job_graph_submit": descJobGraphSubmit,
+	"job_drain":        descJobDrain,
 	"job_status":       descJobStatus,
 	"job_result":       descJobResult,
 	"job_cancel":       descJobCancel,
@@ -336,65 +356,32 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			if !ok {
 				return nil, jobBatchOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
 			}
-			if len(in.Items) == 0 {
-				return nil, jobBatchOutput{}, fmt.Errorf("items cannot be empty")
-			}
-			if len(in.Items) > config.Get().JobMaxBatch {
-				return nil, jobBatchOutput{}, fmt.Errorf("batch too large: %d > %d", len(in.Items), config.Get().JobMaxBatch)
-			}
-			out := jobBatchOutput{Results: make([]jobBatchItemOutput, 0, len(in.Items))}
-			for i, item := range in.Items {
-				snap, err := job.Submit(owner, job.SubmitArgs{
-					Command: item.Command, Cwd: item.Cwd, Class: item.Class, SupersedeKey: item.SupersedeKey,
-					IdempotencyKey: item.IdempotencyKey, DependsOn: item.DependsOn, LockKeys: item.LockKeys,
-					Timeout: time.Duration(item.TimeoutSeconds) * time.Second,
-				})
-				r := jobBatchItemOutput{Index: i}
-				if err != nil {
-					r.Error = err.Error()
-					out.Rejected++
-				} else {
-					snapCopy := snap
-					r.Job = &snapCopy
-					out.Accepted++
-				}
-				out.Results = append(out.Results, r)
-			}
-			e := baseEntry(req, "job_batch_submit", map[string]any{"items": len(in.Items)})
-			e.State = fmt.Sprintf("accepted=%d rejected=%d", out.Accepted, out.Rejected)
-			a.Log(e)
-			return nil, out, nil
-		})
-
-	mcp.AddTool(server, &mcp.Tool{Name: "job_graph_submit", Description: resolveDesc("job_graph_submit")},
-		func(_ context.Context, req *mcp.CallToolRequest, in jobGraphInput) (*mcp.CallToolResult, job.GraphResult, error) {
-			owner, ok := ownerSig(req)
-			if !ok {
-				return nil, job.GraphResult{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
-			}
-			if len(in.Nodes) == 0 {
-				return nil, job.GraphResult{}, fmt.Errorf("nodes cannot be empty")
-			}
-			if len(in.Nodes) > config.Get().JobMaxBatch {
-				return nil, job.GraphResult{}, fmt.Errorf("graph too large: %d > %d", len(in.Nodes), config.Get().JobMaxBatch)
-			}
-			args := job.GraphSubmitArgs{GraphKey: in.GraphKey, Nodes: make([]job.GraphNodeArgs, 0, len(in.Nodes))}
-			for _, node := range in.Nodes {
-				args.Nodes = append(args.Nodes, job.GraphNodeArgs{
-					NodeID: node.NodeID, Command: node.Command, Cwd: node.Cwd, Class: node.Class,
-					SupersedeKey: node.SupersedeKey, DependsOn: node.DependsOn, LockKeys: node.LockKeys,
-					Timeout: time.Duration(node.TimeoutSeconds) * time.Second,
-				})
-			}
-			res, err := job.SubmitGraph(owner, args)
-			e := baseEntry(req, "job_graph_submit", map[string]any{"graph_key": in.GraphKey, "nodes": len(in.Nodes)})
+			out, err := submitBatchAndMaybeWait(owner, in)
+			e := baseEntry(req, "job_batch_submit", map[string]any{"items": len(in.Items), "async": in.Async, "wait_ms": in.WaitMs, "max_bytes_per_job": in.MaxBytesPerJob})
 			if err != nil {
 				e.Error = err.Error()
 			} else {
-				e.State = "accepted"
+				e.State = fmt.Sprintf("accepted=%d rejected=%d terminal=%d pending=%d", out.Accepted, out.Rejected, out.TerminalCount, out.PendingCount)
 			}
 			a.Log(e)
-			return nil, res, err
+			return nil, out, err
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_graph_submit", Description: resolveDesc("job_graph_submit")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobGraphInput) (*mcp.CallToolResult, jobGraphOutput, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, jobGraphOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			out, err := submitGraphAndMaybeWait(owner, in)
+			e := baseEntry(req, "job_graph_submit", map[string]any{"graph_key": in.GraphKey, "nodes": len(in.Nodes), "async": in.Async, "wait_ms": in.WaitMs, "max_bytes_per_job": in.MaxBytesPerJob})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = fmt.Sprintf("terminal=%d pending=%d", out.TerminalCount, out.PendingCount)
+			}
+			a.Log(e)
+			return nil, out, err
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "job_status", Description: resolveDesc("job_status")},
@@ -435,6 +422,23 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			return nil, res, err
 		})
 
+	mcp.AddTool(server, &mcp.Tool{Name: "job_drain", Description: resolveDesc("job_drain")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobDrainInput) (*mcp.CallToolResult, jobDrainOutput, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, jobDrainOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			out, err := drainJobs(owner, in)
+			e := baseEntry(req, "job_drain", map[string]any{"job_ids": len(in.JobIDs), "wait_ms": in.WaitMs, "max_bytes_per_job": in.MaxBytesPerJob})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = fmt.Sprintf("terminal=%d pending=%d remaining_unobserved=%d", out.TerminalCount, out.PendingCount, out.RemainingUnobservedTerminalCount)
+			}
+			a.Log(e)
+			return nil, out, err
+		})
+
 	mcp.AddTool(server, &mcp.Tool{Name: "job_cancel", Description: resolveDesc("job_cancel")},
 		func(_ context.Context, req *mcp.CallToolRequest, in jobIDInput) (*mcp.CallToolResult, job.Snapshot, error) {
 			owner, ok := ownerSig(req)
@@ -459,10 +463,11 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 				return nil, jobListOutput{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
 			}
 			jobs, capacity := job.List(owner)
+			unobserved := job.UnobservedTerminalCount(owner)
 			e := baseEntry(req, "job_list", nil)
-			e.State = "ok"
+			e.State = fmt.Sprintf("ok unobserved_terminal=%d", unobserved)
 			a.Log(e)
-			return nil, jobListOutput{Jobs: jobs, Capacity: capacity}, nil
+			return nil, jobListOutput{Jobs: jobs, Capacity: capacity, UnobservedTerminalCount: unobserved}, nil
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "terminal_open", Description: resolveDesc("terminal_open")},

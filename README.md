@@ -84,8 +84,9 @@ The agent opens a session, runs commands, and streams back results. If it needs 
 | Tool | What it does |
 | --- | --- |
 | `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?, wait_ms?, max_bytes?, async?)` | Submit bounded non-interactive work. By default it stays attached up to 30s (capped by `max_block_seconds`) and returns terminal state + bounded output in the same MCP call; set `async=true` only for intentional detached admission. |
-| `job_batch_submit(items)` | Admit a bounded batch in one MCP call. Each item is independently admitted/rejected under global and per-caller backpressure. |
-| `job_graph_submit(graph_key?, nodes)` | Atomically validate and admit a named dependency DAG. Independent nodes fan out; dependency and lock edges serialize only what must serialize. |
+| `job_batch_submit(items, async?, wait_ms?, max_bytes_per_job?)` | Attached by default: admit the bounded batch, preserve physical concurrency, and return terminal results/output within one shared bounded wait. `async=true` keeps admission-only behavior. |
+| `job_graph_submit(graph_key?, nodes, async?, wait_ms?, max_bytes_per_job?)` | Attached by default: atomically validate/admit the DAG, preserve dependency/lock semantics, and return bounded node outcomes under one shared wait. `async=true` is admission-only. |
+| `job_drain(job_ids?, wait_ms?, max_bytes_per_job?)` | Discover/drain caller-owned unobserved job results without remembered job IDs; explicit IDs provide deterministic retry/reread. |
 | `job_status(job_id)` | Read one caller-owned job's lifecycle state. |
 | `job_result(job_id, max_bytes?)` | Read a bounded tail of caller-owned disk-backed output; bulk output stays local. |
 | `job_cancel(job_id)` | Cancel queued/running caller-owned work. Running descendants are reclaimed with the job. |

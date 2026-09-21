@@ -84,8 +84,9 @@ Agent 会开会话、跑命令、把结果流式带回。如果它需要输密�
 | 工具 | 作用 |
 | --- | --- |
 | `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?, wait_ms?, max_bytes?, async?)` | 提交有界非交互任务；默认在同一次 MCP 调用中有界等待最多 30 秒（受 `max_block_seconds` 限制）并返回终态 + 有界输出，仅在确实需要异步提交时设置 `async=true`。 |
-| `job_batch_submit(items)` | 一次 MCP 调用提交有界批次；每项按全局/调用方背压独立接纳或拒绝。 |
-| `job_graph_submit(graph_key?, nodes)` | 原子校验并接纳命名依赖 DAG；独立节点并发，仅由真实依赖与锁边串行化。 |
+| `job_batch_submit(items, async?, wait_ms?, max_bytes_per_job?)` | 默认附着等待：有界接纳批次、保留物理并发，并在一个共享等待窗口内返回终态结果/输出；`async=true` 保留仅接纳行为。 |
+| `job_graph_submit(graph_key?, nodes, async?, wait_ms?, max_bytes_per_job?)` | 默认附着等待：原子校验/接纳 DAG，保持依赖与锁语义，并在共享等待窗口内返回有界节点结果；`async=true` 仅接纳。 |
+| `job_drain(job_ids?, wait_ms?, max_bytes_per_job?)` | 无需记住 job ID 即可发现/排空当前调用方未观察的终态结果；显式 ID 支持确定性重试/重读。 |
 | `job_status(job_id)` | 读取当前调用方拥有的单个任务状态。 |
 | `job_result(job_id, max_bytes?)` | 读取当前调用方任务的有界磁盘输出尾部；大体量输出留在本机。 |
 | `job_cancel(job_id)` | 取消排队或运行中的当前调用方任务，并回收运行后代。 |
