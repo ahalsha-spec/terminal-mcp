@@ -93,7 +93,7 @@ disable_local_mode = false
 
 # 工具描述覆盖：按工具名改写对外暴露给模型的 MCP 工具说明（集成到外部 MCP、需按自家话术改写时用）。
 # 缺省或留空的工具沿用内置默认描述。key 取以下工具名之一：
-#   job_submit / job_batch_submit / job_status / job_result / job_cancel / job_list /
+#   job_submit / job_batch_submit / job_graph_submit / job_status / job_result / job_cancel / job_list /
 #   terminal_open / terminal_send / terminal_output / terminal_control /
 #   terminal_status / terminal_close / terminal_list / terminal_explore
 # [tool_descriptions]

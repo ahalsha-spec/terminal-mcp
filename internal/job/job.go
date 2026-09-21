@@ -38,49 +38,55 @@ type Config struct {
 }
 
 type SubmitArgs struct {
-	Command      string
-	Cwd          string
-	Class        string
-	SupersedeKey string
-	Timeout      time.Duration
+	Command        string
+	Cwd            string
+	Class          string
+	SupersedeKey   string
+	IdempotencyKey string
+	DependsOn      []string
+	LockKeys       []string
+	Timeout        time.Duration
 }
 
 type Snapshot struct {
-	JobID           string
-	State           string
-	Class           string
-	Command         string
-	Cwd             string
-	SupersedeKey    string
-	CreatedAt       string
-	StartedAt       string
-	FinishedAt      string
-	ExitCode        *int
-	Error           string
-	OutputBytes     int64
-	CancelRequested bool
+	JobID           string   `json:"job_id"`
+	State           string   `json:"state"`
+	Class           string   `json:"class"`
+	Command         string   `json:"command,omitempty"`
+	Cwd             string   `json:"cwd,omitempty"`
+	SupersedeKey    string   `json:"supersede_key,omitempty"`
+	IdempotencyKey  string   `json:"idempotency_key,omitempty"`
+	DependsOn       []string `json:"depends_on,omitempty"`
+	LockKeys        []string `json:"lock_keys,omitempty"`
+	CreatedAt       string   `json:"created_at"`
+	StartedAt       string   `json:"started_at,omitempty"`
+	FinishedAt      string   `json:"finished_at,omitempty"`
+	ExitCode        *int     `json:"exit_code,omitempty"`
+	Error           string   `json:"error,omitempty"`
+	OutputBytes     int64    `json:"output_bytes,omitempty"`
+	CancelRequested bool     `json:"cancel_requested,omitempty"`
 }
 
 type Result struct {
-	Snapshot  Snapshot
-	Output    string
-	Truncated bool
+	Snapshot  Snapshot `json:"job"`
+	Output    string   `json:"output,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
 }
 
 type Capacity struct {
-	Active            int
-	MaxActive         int
-	Queued            int
-	MaxQueued         int
-	CPUHeavy          int
-	MaxCPUHeavy       int
-	AdaptiveMaxActive int
-	Adaptive          bool
-	EffectiveCPU      int
-	CPUSomeAvg10      float64
-	MemorySomeAvg10   float64
-	IOFullAvg10       float64
-	MemoryAvailableMB uint64
+	Active            int     `json:"active"`
+	MaxActive         int     `json:"max_active"`
+	Queued            int     `json:"queued"`
+	MaxQueued         int     `json:"max_queued"`
+	CPUHeavy          int     `json:"cpu_heavy_active"`
+	MaxCPUHeavy       int     `json:"max_cpu_heavy"`
+	AdaptiveMaxActive int     `json:"adaptive_max_active"`
+	Adaptive          bool    `json:"adaptive"`
+	EffectiveCPU      int     `json:"effective_cpu"`
+	CPUSomeAvg10      float64 `json:"cpu_some_avg10"`
+	MemorySomeAvg10   float64 `json:"memory_some_avg10"`
+	IOFullAvg10       float64 `json:"io_full_avg10"`
+	MemoryAvailableMB uint64  `json:"memory_available_mb"`
 }
 
 type Job struct {
@@ -91,6 +97,9 @@ type Job struct {
 	Cwd             string
 	Class           string
 	SupersedeKey    string
+	IdempotencyKey  string
+	DependsOn       []string
+	LockKeys        []string
 	State           string
 	CreatedAt       time.Time
 	StartedAt       time.Time
@@ -114,8 +123,10 @@ func (j *Job) snapshot() Snapshot {
 func (j *Job) snapshotLocked() Snapshot {
 	s := Snapshot{
 		JobID: j.ID, State: j.State, Class: j.Class, Command: j.Command, Cwd: j.Cwd,
-		SupersedeKey: j.SupersedeKey, CreatedAt: j.CreatedAt.UTC().Format(time.RFC3339Nano),
-		ExitCode: j.ExitCode, Error: j.Error, OutputBytes: j.OutputBytes,
+		SupersedeKey: j.SupersedeKey, IdempotencyKey: j.IdempotencyKey,
+		DependsOn: append([]string(nil), j.DependsOn...), LockKeys: append([]string(nil), j.LockKeys...),
+		CreatedAt: j.CreatedAt.UTC().Format(time.RFC3339Nano),
+		ExitCode:  j.ExitCode, Error: j.Error, OutputBytes: j.OutputBytes,
 		CancelRequested: j.CancelRequested,
 	}
 	if !j.StartedAt.IsZero() {
@@ -134,6 +145,9 @@ type store struct {
 	jobs           map[string]*Job
 	queues         map[string][]*Job
 	owners         []string
+	idempotency    map[string]string
+	locks          map[string]string
+	graphs         map[string]*graphRecord
 	active         int
 	activeCPUHeavy int
 	adaptiveMax    int
@@ -191,10 +205,13 @@ func normalizeConfig(c Config) Config {
 func Init(c Config) {
 	c = normalizeConfig(c)
 	s := &store{
-		cfg:    c,
-		jobs:   map[string]*Job{},
-		queues: map[string][]*Job{},
-		stop:   make(chan struct{}),
+		cfg:         c,
+		jobs:        map[string]*Job{},
+		queues:      map[string][]*Job{},
+		idempotency: map[string]string{},
+		locks:       map[string]string{},
+		graphs:      map[string]*graphRecord{},
+		stop:        make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	if c.DisableAdaptive {
@@ -236,6 +253,49 @@ func Shutdown() {
 	}
 }
 
+func normalizeStringSet(in []string) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, len(in))
+	for _, raw := range in {
+		v := strings.TrimSpace(raw)
+		if v == "" {
+			continue
+		}
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func equalStringSlices(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func idempotencyMapKey(owner, key string) string {
+	return owner + string(rune(31)) + key
+}
+
+func isTerminalState(state string) bool {
+	switch state {
+	case "succeeded", "failed", "canceled", "timed_out", "blocked":
+		return true
+	default:
+		return false
+	}
+}
+
 func normalizeClass(v string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(v)) {
 	case "", ClassNormal:
@@ -267,6 +327,11 @@ func Submit(owner string, in SubmitArgs) (Snapshot, error) {
 	if err != nil {
 		return Snapshot{}, err
 	}
+	idempotencyKey := strings.TrimSpace(in.IdempotencyKey)
+	supersedeKey := strings.TrimSpace(in.SupersedeKey)
+	cwd := strings.TrimSpace(in.Cwd)
+	dependsOn := normalizeStringSet(in.DependsOn)
+	lockKeys := normalizeStringSet(in.LockKeys)
 
 	timeout := in.Timeout
 	if timeout <= 0 {
@@ -282,6 +347,39 @@ func Submit(owner string, in SubmitArgs) (Snapshot, error) {
 	if s.closed {
 		s.mu.Unlock()
 		return Snapshot{}, errors.New("job scheduler is shutting down")
+	}
+
+	if idempotencyKey != "" {
+		mapKey := idempotencyMapKey(owner, idempotencyKey)
+		if existingID := s.idempotency[mapKey]; existingID != "" {
+			existing := s.jobs[existingID]
+			if existing != nil {
+				existing.mu.Lock()
+				same := existing.Command == cmd &&
+					existing.Cwd == cwd &&
+					existing.Class == class &&
+					existing.SupersedeKey == supersedeKey &&
+					equalStringSlices(existing.DependsOn, dependsOn) &&
+					equalStringSlices(existing.LockKeys, lockKeys) &&
+					existing.Timeout == timeout
+				snap := existing.snapshotLocked()
+				existing.mu.Unlock()
+				s.mu.Unlock()
+				if !same {
+					return Snapshot{}, fmt.Errorf("idempotency key %q reused with different job definition", idempotencyKey)
+				}
+				return snap, nil
+			}
+			delete(s.idempotency, mapKey)
+		}
+	}
+
+	for _, depID := range dependsOn {
+		dep := s.jobs[depID]
+		if dep == nil || dep.Owner != owner {
+			s.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("dependency not found: %s", depID)
+		}
 	}
 
 	if in.SupersedeKey != "" {
@@ -324,12 +422,16 @@ func Submit(owner string, in SubmitArgs) (Snapshot, error) {
 
 	id := uuid.NewString()
 	j := &Job{
-		ID: id, Owner: owner, Command: cmd, Cwd: strings.TrimSpace(in.Cwd),
-		Class: class, SupersedeKey: strings.TrimSpace(in.SupersedeKey),
+		ID: id, Owner: owner, Command: cmd, Cwd: cwd,
+		Class: class, SupersedeKey: supersedeKey,
+		IdempotencyKey: idempotencyKey, DependsOn: dependsOn, LockKeys: lockKeys,
 		State: "queued", CreatedAt: time.Now(), Timeout: timeout,
 		OutputPath: filepath.Join(s.cfg.DataDir, "jobs", id+".log"),
 	}
 	s.jobs[id] = j
+	if idempotencyKey != "" {
+		s.idempotency[idempotencyMapKey(owner, idempotencyKey)] = id
+	}
 	if _, exists := s.queues[owner]; !exists {
 		s.owners = append(s.owners, owner)
 	}
@@ -357,6 +459,49 @@ func (s *store) removeQueuedLocked(target *Job) {
 		if j == target {
 			s.queues[target.Owner] = append(q[:i], q[i+1:]...)
 			return
+		}
+	}
+}
+
+func (s *store) dependencyStateLocked(j *Job) (ready bool, blockedReason string) {
+	for _, depID := range j.DependsOn {
+		dep := s.jobs[depID]
+		if dep == nil {
+			return false, "dependency disappeared: " + depID
+		}
+		dep.mu.Lock()
+		state := dep.State
+		dep.mu.Unlock()
+		if state == "succeeded" {
+			continue
+		}
+		if isTerminalState(state) {
+			return false, fmt.Sprintf("dependency %s ended %s", depID, state)
+		}
+		return false, ""
+	}
+	return true, ""
+}
+
+func (s *store) locksAvailableLocked(j *Job) bool {
+	for _, key := range j.LockKeys {
+		if holder := s.locks[key]; holder != "" && holder != j.ID {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *store) acquireLocksLocked(j *Job) {
+	for _, key := range j.LockKeys {
+		s.locks[key] = j.ID
+	}
+}
+
+func (s *store) releaseLocksLocked(j *Job) {
+	for _, key := range j.LockKeys {
+		if s.locks[key] == j.ID {
+			delete(s.locks, key)
 		}
 	}
 }
@@ -395,13 +540,34 @@ func (s *store) nextRunnableLocked() *Job {
 				pos--
 				continue
 			}
+			ready, blockedReason := s.dependencyStateLocked(j)
+			if blockedReason != "" {
+				j.mu.Lock()
+				j.State = "blocked"
+				j.Error = blockedReason
+				j.FinishedAt = time.Now()
+				code := -1
+				j.ExitCode = &code
+				j.mu.Unlock()
+				q = append(q[:pos], q[pos+1:]...)
+				s.queues[owner] = q
+				pos--
+				continue
+			}
+			if !ready {
+				continue
+			}
 			if class == ClassCPUHeavy && s.activeCPUHeavy >= s.cfg.MaxCPUHeavy {
 				continue
 			}
 			if !s.cfg.DisableAdaptive && !classAllowedByPressure(class, s.pressure) {
 				continue
 			}
+			if !s.locksAvailableLocked(j) {
+				continue
+			}
 			s.queues[owner] = append(q[:pos], q[pos+1:]...)
+			s.acquireLocksLocked(j)
 			s.lastOwner = owner
 			s.active++
 			if class == ClassCPUHeavy {
@@ -552,6 +718,7 @@ func (s *store) finish(j *Job, exitCode int, runErr error, canceled, timedOut bo
 	j.mu.Unlock()
 
 	s.mu.Lock()
+	s.releaseLocksLocked(j)
 	if s.active > 0 {
 		s.active--
 	}
@@ -701,13 +868,36 @@ func (s *store) gcLoop() {
 			s.mu.Lock()
 			for id, j := range s.jobs {
 				j.mu.Lock()
-				terminal := j.State == "succeeded" || j.State == "failed" || j.State == "canceled" || j.State == "timed_out"
+				terminal := isTerminalState(j.State)
 				expired := terminal && !j.FinishedAt.IsZero() && j.FinishedAt.Before(cutoff)
 				path := j.OutputPath
+				owner := j.Owner
+				idempotencyKey := j.IdempotencyKey
 				j.mu.Unlock()
 				if expired {
+					if idempotencyKey != "" {
+						mapKey := idempotencyMapKey(owner, idempotencyKey)
+						if s.idempotency[mapKey] == id {
+							delete(s.idempotency, mapKey)
+						}
+					}
 					delete(s.jobs, id)
 					removePaths = append(removePaths, path)
+				}
+			}
+			for key, rec := range s.graphs {
+				if rec.CreatedAt.After(cutoff) {
+					continue
+				}
+				allGone := true
+				for _, jobID := range rec.JobIDs {
+					if _, exists := s.jobs[jobID]; exists {
+						allGone = false
+						break
+					}
+				}
+				if allGone {
+					delete(s.graphs, key)
 				}
 			}
 			s.mu.Unlock()

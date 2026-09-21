@@ -53,15 +53,34 @@ type exploreInput struct {
 }
 
 type jobSubmitInput struct {
-	Command        string `json:"command" jsonschema:"non-interactive command to execute through the bounded job scheduler"`
-	Cwd            string `json:"cwd,omitempty" jsonschema:"optional working directory"`
-	Class          string `json:"class,omitempty" jsonschema:"normal | cpu_heavy | io_wait | background"`
-	SupersedeKey   string `json:"supersede_key,omitempty" jsonschema:"optional logical key; newer jobs from this caller cancel older queued/running jobs with the same key"`
-	TimeoutSeconds int    `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to its configured maximum"`
+	Command        string   `json:"command" jsonschema:"non-interactive command to execute through the bounded job scheduler"`
+	Cwd            string   `json:"cwd,omitempty" jsonschema:"optional working directory"`
+	Class          string   `json:"class,omitempty" jsonschema:"normal | cpu_heavy | io_wait | background"`
+	SupersedeKey   string   `json:"supersede_key,omitempty" jsonschema:"optional logical key; newer jobs from this caller cancel older queued/running jobs with the same key"`
+	IdempotencyKey string   `json:"idempotency_key,omitempty" jsonschema:"optional retry key; identical replay returns the existing job, changed payload under the same key is rejected"`
+	DependsOn      []string `json:"depends_on,omitempty" jsonschema:"existing job ids owned by this caller that must succeed before this job may run"`
+	LockKeys       []string `json:"lock_keys,omitempty" jsonschema:"global mutual-exclusion resource keys; conflicting jobs wait rather than overlap"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to its configured maximum"`
 }
 
 type jobBatchInput struct {
 	Items []jobSubmitInput `json:"items" jsonschema:"independent jobs to admit in one call; bounded by job_max_batch and normal queue limits"`
+}
+
+type jobGraphNodeInput struct {
+	NodeID         string   `json:"node_id" jsonschema:"caller-stable node id unique within this graph"`
+	Command        string   `json:"command" jsonschema:"non-interactive command for this graph node"`
+	Cwd            string   `json:"cwd,omitempty" jsonschema:"optional working directory"`
+	Class          string   `json:"class,omitempty" jsonschema:"normal | cpu_heavy | io_wait | background"`
+	SupersedeKey   string   `json:"supersede_key,omitempty" jsonschema:"optional logical key; cancels older same-purpose work before graph admission"`
+	DependsOn      []string `json:"depends_on,omitempty" jsonschema:"node_id values in this same graph that must succeed first"`
+	LockKeys       []string `json:"lock_keys,omitempty" jsonschema:"global mutual-exclusion resource keys"`
+	TimeoutSeconds int      `json:"timeout_seconds,omitempty" jsonschema:"execution timeout; server clamps to configured maximum"`
+}
+
+type jobGraphInput struct {
+	GraphKey string              `json:"graph_key,omitempty" jsonschema:"optional idempotency key for the entire graph; identical replay returns existing job handles"`
+	Nodes    []jobGraphNodeInput `json:"nodes" jsonschema:"named DAG nodes; bounded by job_max_batch"`
 }
 
 type jobBatchItemOutput struct {
@@ -154,9 +173,14 @@ const (
 
 	descJobSubmit = "Submit bounded non-interactive machine work without consuming a persistent PTY. " +
 		"Prefer this for tests, builds, searches, file transforms and deterministic scripts. The scheduler admits many logical callers but bounds physical execution, applies per-caller/global queue limits, and round-robins across callers. " +
-		"Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. supersede_key lets newer work cancel stale work with the same logical purpose."
-	descJobBatchSubmit = "Submit a bounded batch of independent non-interactive jobs in one MCP call. " +
-		"Use this instead of many serial tool calls when work is separable. Admission remains subject to the same global/per-caller queue limits and adaptive physical scheduler; each item reports accepted or rejected explicitly."
+		"Use class=cpu_heavy for sustained CPU work, io_wait for mostly waiting/I/O work, background for deferrable work, otherwise normal. " +
+		"supersede_key cancels stale same-purpose work; idempotency_key deduplicates exact retries and rejects changed payloads; depends_on gates execution on prior successful jobs; lock_keys serialize conflicting resources."
+	descJobBatchSubmit = "Submit a bounded batch of non-interactive jobs in one MCP call. " +
+		"Use this instead of many serial tool calls when work is separable. Each item supports idempotency, existing-job dependencies and lock keys. " +
+		"Admission remains subject to the same global/per-caller queue limits and adaptive physical scheduler; each item reports accepted or rejected explicitly."
+	descJobGraphSubmit = "Submit a bounded named dependency DAG in one MCP call. " +
+		"Independent nodes may run concurrently; depends_on edges serialize only true prerequisites; lock_keys prevent conflicting resource overlap. " +
+		"The graph is validated and queue-admitted atomically, so cycles or capacity failures leave no partial graph. graph_key makes exact retries idempotent and rejects changed definitions."
 	descJobStatus = "Read one job's state. Use for genuinely asynchronous work; do not rapid-poll."
 	descJobResult = "Read a bounded tail of a job's disk-backed output. Large output stays local; max_bytes is clamped by the server."
 	descJobCancel = "Cancel queued or running work owned by this caller. Running process groups are terminated; use when work becomes stale or is superseded."
@@ -173,6 +197,7 @@ const (
 var defaultDescriptions = map[string]string{
 	"job_submit":       descJobSubmit,
 	"job_batch_submit": descJobBatchSubmit,
+	"job_graph_submit": descJobGraphSubmit,
 	"job_status":       descJobStatus,
 	"job_result":       descJobResult,
 	"job_cancel":       descJobCancel,
@@ -234,10 +259,13 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			}
 			snap, err := job.Submit(owner, job.SubmitArgs{
 				Command: in.Command, Cwd: in.Cwd, Class: in.Class, SupersedeKey: in.SupersedeKey,
+				IdempotencyKey: in.IdempotencyKey, DependsOn: in.DependsOn, LockKeys: in.LockKeys,
 				Timeout: time.Duration(in.TimeoutSeconds) * time.Second,
 			})
 			e := baseEntry(req, "job_submit", map[string]any{
-				"class": in.Class, "cwd": in.Cwd, "supersede_key": in.SupersedeKey, "timeout_seconds": in.TimeoutSeconds,
+				"class": in.Class, "cwd": in.Cwd, "supersede_key": in.SupersedeKey,
+				"idempotency_key": in.IdempotencyKey, "depends_on": len(in.DependsOn), "lock_keys": len(in.LockKeys),
+				"timeout_seconds": in.TimeoutSeconds,
 			})
 			if err != nil {
 				e.Error = err.Error()
@@ -264,6 +292,7 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			for i, item := range in.Items {
 				snap, err := job.Submit(owner, job.SubmitArgs{
 					Command: item.Command, Cwd: item.Cwd, Class: item.Class, SupersedeKey: item.SupersedeKey,
+					IdempotencyKey: item.IdempotencyKey, DependsOn: item.DependsOn, LockKeys: item.LockKeys,
 					Timeout: time.Duration(item.TimeoutSeconds) * time.Second,
 				})
 				r := jobBatchItemOutput{Index: i}
@@ -281,6 +310,37 @@ func registerTools(server *mcp.Server, a *audit.Logger) {
 			e.State = fmt.Sprintf("accepted=%d rejected=%d", out.Accepted, out.Rejected)
 			a.Log(e)
 			return nil, out, nil
+		})
+
+	mcp.AddTool(server, &mcp.Tool{Name: "job_graph_submit", Description: resolveDesc("job_graph_submit")},
+		func(_ context.Context, req *mcp.CallToolRequest, in jobGraphInput) (*mcp.CallToolResult, job.GraphResult, error) {
+			owner, ok := ownerSig(req)
+			if !ok {
+				return nil, job.GraphResult{}, fmt.Errorf("missing required identity header(s): %v", config.Get().Identity.Headers)
+			}
+			if len(in.Nodes) == 0 {
+				return nil, job.GraphResult{}, fmt.Errorf("nodes cannot be empty")
+			}
+			if len(in.Nodes) > config.Get().JobMaxBatch {
+				return nil, job.GraphResult{}, fmt.Errorf("graph too large: %d > %d", len(in.Nodes), config.Get().JobMaxBatch)
+			}
+			args := job.GraphSubmitArgs{GraphKey: in.GraphKey, Nodes: make([]job.GraphNodeArgs, 0, len(in.Nodes))}
+			for _, node := range in.Nodes {
+				args.Nodes = append(args.Nodes, job.GraphNodeArgs{
+					NodeID: node.NodeID, Command: node.Command, Cwd: node.Cwd, Class: node.Class,
+					SupersedeKey: node.SupersedeKey, DependsOn: node.DependsOn, LockKeys: node.LockKeys,
+					Timeout: time.Duration(node.TimeoutSeconds) * time.Second,
+				})
+			}
+			res, err := job.SubmitGraph(owner, args)
+			e := baseEntry(req, "job_graph_submit", map[string]any{"graph_key": in.GraphKey, "nodes": len(in.Nodes)})
+			if err != nil {
+				e.Error = err.Error()
+			} else {
+				e.State = "accepted"
+			}
+			a.Log(e)
+			return nil, res, err
 		})
 
 	mcp.AddTool(server, &mcp.Tool{Name: "job_status", Description: resolveDesc("job_status")},

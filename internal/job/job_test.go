@@ -16,7 +16,7 @@ func waitState(t *testing.T, owner, id string, terminal bool) Snapshot {
 		}
 		if terminal {
 			switch snap.State {
-			case "succeeded", "failed", "canceled", "timed_out":
+			case "succeeded", "failed", "canceled", "timed_out", "blocked":
 				return snap
 			}
 		} else if snap.State == "running" {
@@ -294,5 +294,248 @@ func TestAdaptivePressurePolicy(t *testing.T) {
 	bgHot.IOFullAvg10 = 15
 	if classAllowedByPressure(ClassBackground, bgHot) {
 		t.Fatal("background should yield under I/O pressure")
+	}
+}
+
+func TestIdempotencyDeduplicatesAndRejectsDrift(t *testing.T) {
+	Init(testConfig(t, 2, 8, 8, 1))
+	defer Shutdown()
+
+	first, err := Submit("a", SubmitArgs{
+		Command:        "sleep 0.10; echo once",
+		IdempotencyKey: "op-1",
+		LockKeys:       []string{"repo:x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := Submit("a", SubmitArgs{
+		Command:        "sleep 0.10; echo once",
+		IdempotencyKey: "op-1",
+		LockKeys:       []string{"repo:x"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.JobID != second.JobID {
+		t.Fatalf("idempotent replay created duplicate jobs: %s vs %s", first.JobID, second.JobID)
+	}
+
+	if _, err := Submit("a", SubmitArgs{
+		Command:        "echo changed",
+		IdempotencyKey: "op-1",
+		LockKeys:       []string{"repo:x"},
+	}); err == nil {
+		t.Fatal("expected changed payload under same idempotency key to be rejected")
+	}
+
+	done := waitState(t, "a", first.JobID, true)
+	if done.State != "succeeded" {
+		t.Fatalf("idempotent job state=%s err=%s", done.State, done.Error)
+	}
+}
+
+func TestDependenciesSerializeAndPropagateFailure(t *testing.T) {
+	Init(testConfig(t, 3, 12, 12, 2))
+	defer Shutdown()
+
+	dep, err := Submit("a", SubmitArgs{Command: "sleep 0.12; echo dep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := Submit("a", SubmitArgs{
+		Command:   "echo child",
+		DependsOn: []string{dep.JobID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	depDone := waitState(t, "a", dep.JobID, true)
+	childDone := waitState(t, "a", child.JobID, true)
+	if depDone.State != "succeeded" || childDone.State != "succeeded" {
+		t.Fatalf("dependency chain states dep=%s child=%s", depDone.State, childDone.State)
+	}
+	depFinish, err := time.Parse(time.RFC3339Nano, depDone.FinishedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	childStart, err := time.Parse(time.RFC3339Nano, childDone.StartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if childStart.Before(depFinish) {
+		t.Fatalf("child started before dependency completed: child=%s dep=%s", childStart, depFinish)
+	}
+
+	bad, err := Submit("a", SubmitArgs{Command: "exit 7"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := Submit("a", SubmitArgs{
+		Command:   "echo should-not-run",
+		DependsOn: []string{bad.JobID},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitState(t, "a", bad.JobID, true); got.State != "failed" {
+		t.Fatalf("bad dependency state=%s", got.State)
+	}
+	blockedDone := waitState(t, "a", blocked.JobID, true)
+	if blockedDone.State != "blocked" || !strings.Contains(blockedDone.Error, bad.JobID) {
+		t.Fatalf("dependent should block with dependency identity: %+v", blockedDone)
+	}
+}
+
+func TestLockKeysPreventConflictingOverlap(t *testing.T) {
+	Init(testConfig(t, 2, 8, 8, 2))
+	defer Shutdown()
+
+	a, err := Submit("a", SubmitArgs{
+		Command:  "sleep 0.18; echo a",
+		LockKeys: []string{"repo:shared"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := Submit("b", SubmitArgs{
+		Command:  "sleep 0.18; echo b",
+		LockKeys: []string{"repo:shared"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	aDone := waitState(t, "a", a.JobID, true)
+	bDone := waitState(t, "b", b.JobID, true)
+	if aDone.State != "succeeded" || bDone.State != "succeeded" {
+		t.Fatalf("lock jobs states a=%s b=%s", aDone.State, bDone.State)
+	}
+
+	as, _ := time.Parse(time.RFC3339Nano, aDone.StartedAt)
+	af, _ := time.Parse(time.RFC3339Nano, aDone.FinishedAt)
+	bs, _ := time.Parse(time.RFC3339Nano, bDone.StartedAt)
+	bf, _ := time.Parse(time.RFC3339Nano, bDone.FinishedAt)
+	overlap := as.Before(bf) && bs.Before(af)
+	if overlap {
+		t.Fatalf("conflicting lock jobs overlapped: a=%s..%s b=%s..%s", as, af, bs, bf)
+	}
+}
+
+func TestGraphDependenciesAndReplay(t *testing.T) {
+	Init(testConfig(t, 3, 12, 12, 2))
+	defer Shutdown()
+
+	graph, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "build-graph",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "inspect-a", Command: "sleep 0.12; echo a"},
+			{NodeID: "inspect-b", Command: "sleep 0.12; echo b"},
+			{NodeID: "join", Command: "echo joined", DependsOn: []string{"inspect-a", "inspect-b"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(graph.Nodes) != 3 {
+		t.Fatalf("graph nodes=%d, want 3", len(graph.Nodes))
+	}
+
+	ids := map[string]string{}
+	for _, node := range graph.Nodes {
+		ids[node.NodeID] = node.Job.JobID
+	}
+	aDone := waitState(t, "a", ids["inspect-a"], true)
+	bDone := waitState(t, "a", ids["inspect-b"], true)
+	joinDone := waitState(t, "a", ids["join"], true)
+	if aDone.State != "succeeded" || bDone.State != "succeeded" || joinDone.State != "succeeded" {
+		t.Fatalf("graph states a=%s b=%s join=%s", aDone.State, bDone.State, joinDone.State)
+	}
+
+	joinStart, _ := time.Parse(time.RFC3339Nano, joinDone.StartedAt)
+	aFinish, _ := time.Parse(time.RFC3339Nano, aDone.FinishedAt)
+	bFinish, _ := time.Parse(time.RFC3339Nano, bDone.FinishedAt)
+	if joinStart.Before(aFinish) || joinStart.Before(bFinish) {
+		t.Fatalf("join started before dependencies finished: join=%s a=%s b=%s", joinStart, aFinish, bFinish)
+	}
+
+	replay, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "build-graph",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "join", Command: "echo joined", DependsOn: []string{"inspect-b", "inspect-a"}},
+			{NodeID: "inspect-b", Command: "sleep 0.12; echo b"},
+			{NodeID: "inspect-a", Command: "sleep 0.12; echo a"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayIDs := map[string]string{}
+	for _, node := range replay.Nodes {
+		replayIDs[node.NodeID] = node.Job.JobID
+	}
+	for nodeID, id := range ids {
+		if replayIDs[nodeID] != id {
+			t.Fatalf("graph replay duplicated node %s: %s vs %s", nodeID, id, replayIDs[nodeID])
+		}
+	}
+
+	if _, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "build-graph",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "inspect-a", Command: "echo CHANGED"},
+			{NodeID: "inspect-b", Command: "sleep 0.12; echo b"},
+			{NodeID: "join", Command: "echo joined", DependsOn: []string{"inspect-a", "inspect-b"}},
+		},
+	}); err == nil {
+		t.Fatal("expected changed graph under same graph key to be rejected")
+	}
+}
+
+func TestGraphCycleRejectsAtomically(t *testing.T) {
+	Init(testConfig(t, 2, 8, 8, 1))
+	defer Shutdown()
+
+	if _, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "cycle",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "a", Command: "echo a", DependsOn: []string{"b"}},
+			{NodeID: "b", Command: "echo b", DependsOn: []string{"a"}},
+		},
+	}); err == nil {
+		t.Fatal("expected cycle rejection")
+	}
+
+	jobs, cap := List("a")
+	if len(jobs) != 0 || cap.Queued != 0 || cap.Active != 0 {
+		t.Fatalf("cycle rejection left partial work: jobs=%d cap=%+v", len(jobs), cap)
+	}
+}
+
+func TestGraphAdmissionIsAllOrNothing(t *testing.T) {
+	Init(testConfig(t, 1, 3, 2, 1))
+	defer Shutdown()
+
+	blocker, err := Submit("a", SubmitArgs{Command: "sleep 0.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", blocker.JobID, false)
+
+	if _, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "too-large",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "x", Command: "echo x"},
+			{NodeID: "y", Command: "echo y"},
+			{NodeID: "z", Command: "echo z"},
+		},
+	}); err == nil {
+		t.Fatal("expected owner queue admission rejection")
+	}
+
+	jobs, _ := List("a")
+	if len(jobs) != 1 || jobs[0].JobID != blocker.JobID {
+		t.Fatalf("graph admission was partial; jobs=%+v", jobs)
 	}
 }
