@@ -74,19 +74,23 @@ type Result struct {
 }
 
 type Capacity struct {
-	Active            int     `json:"active"`
-	MaxActive         int     `json:"max_active"`
-	Queued            int     `json:"queued"`
-	MaxQueued         int     `json:"max_queued"`
-	CPUHeavy          int     `json:"cpu_heavy_active"`
-	MaxCPUHeavy       int     `json:"max_cpu_heavy"`
-	AdaptiveMaxActive int     `json:"adaptive_max_active"`
-	Adaptive          bool    `json:"adaptive"`
-	EffectiveCPU      int     `json:"effective_cpu"`
-	CPUSomeAvg10      float64 `json:"cpu_some_avg10"`
-	MemorySomeAvg10   float64 `json:"memory_some_avg10"`
-	IOFullAvg10       float64 `json:"io_full_avg10"`
-	MemoryAvailableMB uint64  `json:"memory_available_mb"`
+	Active                int     `json:"active"`
+	MaxActive             int     `json:"max_active"`
+	Queued                int     `json:"queued"`
+	MaxQueued             int     `json:"max_queued"`
+	CPUHeavy              int     `json:"cpu_heavy_active"`
+	MaxCPUHeavy           int     `json:"max_cpu_heavy"`
+	AdaptiveMaxActive     int     `json:"adaptive_max_active"`
+	Adaptive              bool    `json:"adaptive"`
+	EffectiveCPU          int     `json:"effective_cpu"`
+	CPUSomeAvg10          float64 `json:"cpu_some_avg10"`
+	MemorySomeAvg10       float64 `json:"memory_some_avg10"`
+	IOFullAvg10           float64 `json:"io_full_avg10"`
+	MemoryAvailableMB     uint64  `json:"memory_available_mb"`
+	MemoryCgroupCurrentMB uint64  `json:"memory_cgroup_current_mb,omitempty"`
+	MemoryCgroupBudgetMB  uint64  `json:"memory_cgroup_budget_mb,omitempty"`
+	CgroupIsolation       bool    `json:"cgroup_isolation"`
+	CgroupIsolationError  string  `json:"cgroup_isolation_error,omitempty"`
 }
 
 type Job struct {
@@ -142,6 +146,7 @@ type store struct {
 	mu             sync.Mutex
 	cond           *sync.Cond
 	cfg            Config
+	cgroupSetupErr error
 	jobs           map[string]*Job
 	queues         map[string][]*Job
 	owners         []string
@@ -204,14 +209,16 @@ func normalizeConfig(c Config) Config {
 
 func Init(c Config) {
 	c = normalizeConfig(c)
+	cgroupSetupErr := prepareJobCgroupIsolation()
 	s := &store{
-		cfg:         c,
-		jobs:        map[string]*Job{},
-		queues:      map[string][]*Job{},
-		idempotency: map[string]string{},
-		locks:       map[string]string{},
-		graphs:      map[string]*graphRecord{},
-		stop:        make(chan struct{}),
+		cfg:            c,
+		cgroupSetupErr: cgroupSetupErr,
+		jobs:           map[string]*Job{},
+		queues:         map[string][]*Job{},
+		idempotency:    map[string]string{},
+		locks:          map[string]string{},
+		graphs:         map[string]*graphRecord{},
+		stop:           make(chan struct{}),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	if c.DisableAdaptive {
@@ -230,6 +237,7 @@ func Init(c Config) {
 	}
 
 	_ = os.MkdirAll(filepath.Join(c.DataDir, "jobs"), 0o700)
+	s.sweepOrphanOutputs(time.Now().Add(-c.Retention))
 	go s.dispatch()
 	go s.gcLoop()
 	if !c.DisableAdaptive {
@@ -311,6 +319,78 @@ func normalizeClass(v string) (string, error) {
 	}
 }
 
+type supersessionPlan struct {
+	queued  []*Job
+	running []*Job
+}
+
+func (s *store) planSupersessionLocked(owner string, keys map[string]struct{}) supersessionPlan {
+	var plan supersessionPlan
+	if len(keys) == 0 {
+		return plan
+	}
+	for _, existing := range s.jobs {
+		if existing.Owner != owner {
+			continue
+		}
+		if _, ok := keys[existing.SupersedeKey]; !ok || existing.SupersedeKey == "" {
+			continue
+		}
+		existing.mu.Lock()
+		state := existing.State
+		existing.mu.Unlock()
+		switch state {
+		case "queued":
+			plan.queued = append(plan.queued, existing)
+		case "running":
+			plan.running = append(plan.running, existing)
+		}
+	}
+	return plan
+}
+
+func (p supersessionPlan) containsJobID(id string) bool {
+	for _, j := range p.queued {
+		if j.ID == id {
+			return true
+		}
+	}
+	for _, j := range p.running {
+		if j.ID == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *store) applySupersessionLocked(plan supersessionPlan) []context.CancelFunc {
+	var cancels []context.CancelFunc
+	for _, existing := range plan.queued {
+		existing.mu.Lock()
+		if existing.State == "queued" {
+			existing.State = "canceled"
+			existing.CancelRequested = true
+			existing.FinishedAt = time.Now()
+			code := -1
+			existing.ExitCode = &code
+			existing.Error = "canceled"
+			s.removeQueuedLocked(existing)
+		}
+		existing.mu.Unlock()
+	}
+	for _, existing := range plan.running {
+		existing.mu.Lock()
+		if existing.State == "running" {
+			existing.CancelRequested = true
+			if existing.cancel != nil {
+				cancels = append(cancels, existing.cancel)
+			}
+		}
+		existing.mu.Unlock()
+	}
+	return cancels
+}
+
 func Submit(owner string, in SubmitArgs) (Snapshot, error) {
 	s := current()
 	if s == nil {
@@ -382,43 +462,30 @@ func Submit(owner string, in SubmitArgs) (Snapshot, error) {
 		}
 	}
 
-	if in.SupersedeKey != "" {
-		for _, existing := range s.jobs {
-			if existing.Owner != owner || existing.SupersedeKey != in.SupersedeKey {
-				continue
-			}
-			existing.mu.Lock()
-			switch existing.State {
-			case "queued":
-				existing.State = "canceled"
-				existing.CancelRequested = true
-				existing.FinishedAt = time.Now()
-				s.removeQueuedLocked(existing)
-			case "running":
-				existing.CancelRequested = true
-				if existing.cancel != nil {
-					cancels = append(cancels, existing.cancel)
-				}
-			}
-			existing.mu.Unlock()
+	keys := map[string]struct{}{}
+	if supersedeKey != "" {
+		keys[supersedeKey] = struct{}{}
+	}
+	plan := s.planSupersessionLocked(owner, keys)
+	for _, depID := range dependsOn {
+		if plan.containsJobID(depID) {
+			s.mu.Unlock()
+			return Snapshot{}, fmt.Errorf("job cannot supersede its dependency: %s", depID)
 		}
 	}
 
-	queued := s.queuedCountLocked()
+	queued := s.queuedCountLocked() - len(plan.queued)
 	if queued >= s.cfg.MaxQueued {
 		s.mu.Unlock()
-		for _, cancel := range cancels {
-			cancel()
-		}
-		return Snapshot{}, fmt.Errorf("job queue full: %d/%d", queued, s.cfg.MaxQueued)
+		return Snapshot{}, fmt.Errorf("job queue full after supersession plan: %d/%d", queued, s.cfg.MaxQueued)
 	}
-	if len(s.queues[owner]) >= s.cfg.MaxQueuedPerOwner {
+	ownerQueued := len(s.queues[owner]) - len(plan.queued)
+	if ownerQueued >= s.cfg.MaxQueuedPerOwner {
 		s.mu.Unlock()
-		for _, cancel := range cancels {
-			cancel()
-		}
-		return Snapshot{}, fmt.Errorf("owner job queue full: %d/%d", len(s.queues[owner]), s.cfg.MaxQueuedPerOwner)
+		return Snapshot{}, fmt.Errorf("owner job queue full after supersession plan: %d/%d", ownerQueued, s.cfg.MaxQueuedPerOwner)
 	}
+
+	cancels = s.applySupersessionLocked(plan)
 
 	id := uuid.NewString()
 	j := &Job{
@@ -506,7 +573,23 @@ func (s *store) releaseLocksLocked(j *Job) {
 	}
 }
 
+func (s *store) compactOwnersLocked() {
+	if len(s.owners) == 0 {
+		return
+	}
+	kept := s.owners[:0]
+	for _, owner := range s.owners {
+		if len(s.queues[owner]) == 0 {
+			delete(s.queues, owner)
+			continue
+		}
+		kept = append(kept, owner)
+	}
+	s.owners = kept
+}
+
 func (s *store) nextRunnableLocked() *Job {
+	s.compactOwnersLocked()
 	limit := s.adaptiveMax
 	if limit <= 0 || limit > s.cfg.MaxActive {
 		limit = s.cfg.MaxActive
@@ -623,7 +706,52 @@ func (s *store) run(j *Job) {
 	}
 	j.mu.Unlock()
 
-	cmd := exec.CommandContext(ctx, "/bin/bash", "-lc", j.Command)
+	if s.cgroupSetupErr != nil {
+		s.finish(j, -1, fmt.Errorf("job cgroup isolation setup: %w", s.cgroupSetupErr), false, false)
+		return
+	}
+	cg, err := createJobCgroup(j.ID)
+	if err != nil {
+		s.finish(j, -1, err, false, false)
+		return
+	}
+	cleanupCgroup := func(runErr error) error {
+		if cg == nil {
+			return runErr
+		}
+		if err := cg.terminateAndRemove(); err != nil {
+			wrapped := fmt.Errorf("job cgroup cleanup: %w", err)
+			if runErr == nil {
+				return wrapped
+			}
+			return errors.Join(runErr, wrapped)
+		}
+		return runErr
+	}
+	finishSetupFailure := func(runErr error) {
+		cleanupOnlyErr := cleanupCgroup(nil)
+		if cleanupOnlyErr != nil {
+			runErr = errors.Join(runErr, cleanupOnlyErr)
+		}
+		j.mu.Lock()
+		cancelRequested := j.CancelRequested
+		j.mu.Unlock()
+		timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+		if cleanupOnlyErr != nil {
+			cancelRequested = false
+			timedOut = false
+		}
+		s.finish(j, -1, runErr, cancelRequested, timedOut)
+	}
+
+	gateR, gateW, err := os.Pipe()
+	if err != nil {
+		finishSetupFailure(fmt.Errorf("create job start gate: %w", err))
+		return
+	}
+
+	cmd := exec.CommandContext(ctx, "/bin/bash", "-c", `IFS= read -r _ <&3 || exit 125; exec 3<&-; exec /bin/bash -lc "$1"`, "mu-job-gate", j.Command)
+	cmd.ExtraFiles = []*os.File{gateR}
 	if j.Cwd != "" {
 		cmd.Dir = j.Cwd
 	}
@@ -643,12 +771,34 @@ func (s *store) run(j *Job) {
 	}
 
 	if err := cmd.Start(); err != nil {
-		s.finish(j, -1, err, false, false)
+		_ = gateR.Close()
+		_ = gateW.Close()
+		finishSetupFailure(err)
 		return
 	}
+	_ = gateR.Close()
+
 	j.mu.Lock()
 	j.proc = cmd.Process
 	j.mu.Unlock()
+
+	if cg != nil {
+		if err := cg.attach(cmd.Process.Pid); err != nil {
+			_ = gateW.Close()
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+			_ = cmd.Wait()
+			finishSetupFailure(fmt.Errorf("attach job process to cgroup: %w", err))
+			return
+		}
+	}
+	if _, err := io.WriteString(gateW, "go\n"); err != nil {
+		_ = gateW.Close()
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		_ = cmd.Wait()
+		finishSetupFailure(fmt.Errorf("release job start gate: %w", err))
+		return
+	}
+	_ = gateW.Close()
 
 	done := make(chan struct{})
 	go func() {
@@ -661,7 +811,9 @@ func (s *store) run(j *Job) {
 				return
 			case <-timer.C:
 			}
-			if cmd.Process != nil {
+			if cg != nil {
+				_ = cg.killAll()
+			} else if cmd.Process != nil {
 				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			}
 		case <-done:
@@ -692,6 +844,13 @@ func (s *store) run(j *Job) {
 	j.mu.Unlock()
 
 	timedOut := errors.Is(ctx.Err(), context.DeadlineExceeded)
+	cleanupErr := cleanupCgroup(nil)
+	if cleanupErr != nil {
+		err = errors.Join(err, cleanupErr)
+		exitCode = -1
+		cancelRequested = false
+		timedOut = false
+	}
 	s.finish(j, exitCode, err, cancelRequested, timedOut)
 }
 
@@ -792,6 +951,11 @@ func List(owner string) ([]Snapshot, Capacity) {
 			jobs = append(jobs, j)
 		}
 	}
+	cgroupIsolation := s.cgroupSetupErr == nil && jobCgroupIsolationAvailable()
+	cgroupIsolationError := ""
+	if s.cgroupSetupErr != nil {
+		cgroupIsolationError = s.cgroupSetupErr.Error()
+	}
 	capacity := Capacity{
 		Active: s.active, MaxActive: s.cfg.MaxActive,
 		Queued: s.queuedCountLocked(), MaxQueued: s.cfg.MaxQueued,
@@ -800,6 +964,10 @@ func List(owner string) ([]Snapshot, Capacity) {
 		EffectiveCPU: s.pressure.EffectiveCPU,
 		CPUSomeAvg10: s.pressure.CPUSomeAvg10, MemorySomeAvg10: s.pressure.MemorySomeAvg10,
 		IOFullAvg10: s.pressure.IOFullAvg10, MemoryAvailableMB: s.pressure.MemoryAvailableBytes >> 20,
+		MemoryCgroupCurrentMB: s.pressure.MemoryCgroupCurrentBytes >> 20,
+		MemoryCgroupBudgetMB:  s.pressure.MemoryCgroupBudgetBytes >> 20,
+		CgroupIsolation:       cgroupIsolation,
+		CgroupIsolationError:  cgroupIsolationError,
 	}
 	s.mu.Unlock()
 
@@ -857,6 +1025,99 @@ func ResultFor(owner, id string, maxBytes int64) (Result, error) {
 	return Result{Snapshot: snap, Output: string(b), Truncated: truncated}, nil
 }
 
+func (s *store) sweepOrphanOutputs(cutoff time.Time) {
+	jobsDir := filepath.Join(s.cfg.DataDir, "jobs")
+	live := make(map[string]struct{})
+	s.mu.Lock()
+	for _, j := range s.jobs {
+		j.mu.Lock()
+		path := j.OutputPath
+		j.mu.Unlock()
+		if path != "" {
+			live[path] = struct{}{}
+		}
+	}
+	s.mu.Unlock()
+
+	entries, err := os.ReadDir(jobsDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".log" {
+			continue
+		}
+		path := filepath.Join(jobsDir, entry.Name())
+		if _, ok := live[path]; ok {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		_ = os.Remove(path)
+	}
+}
+
+func (s *store) protectedJobsLocked(cutoff time.Time) map[string]struct{} {
+	protected := make(map[string]struct{})
+
+	// A non-terminal job still needs its dependency records to decide whether it
+	// may run or must block. Never GC those dependencies out from under it.
+	for _, j := range s.jobs {
+		j.mu.Lock()
+		terminal := isTerminalState(j.State)
+		deps := append([]string(nil), j.DependsOn...)
+		j.mu.Unlock()
+		if terminal {
+			continue
+		}
+		for _, depID := range deps {
+			protected[depID] = struct{}{}
+		}
+	}
+
+	// A keyed graph is an idempotent generation: retain every node record until
+	// the whole graph is terminal and the newest terminal node has aged past the
+	// retention window. This prevents partial replay of a still-live generation.
+	for key, rec := range s.graphs {
+		allPresent := true
+		allTerminal := true
+		latestFinished := time.Time{}
+		for _, jobID := range rec.JobIDs {
+			j := s.jobs[jobID]
+			if j == nil {
+				allPresent = false
+				break
+			}
+			j.mu.Lock()
+			terminal := isTerminalState(j.State)
+			finished := j.FinishedAt
+			j.mu.Unlock()
+			if !terminal {
+				allTerminal = false
+			}
+			if finished.After(latestFinished) {
+				latestFinished = finished
+			}
+		}
+		if !allPresent {
+			// Legacy/partial state cannot satisfy exact graph replay; drop the key
+			// rather than retaining an incomplete generation indefinitely.
+			delete(s.graphs, key)
+			continue
+		}
+		if allTerminal && !latestFinished.IsZero() && latestFinished.Before(cutoff) {
+			delete(s.graphs, key)
+			continue
+		}
+		for _, jobID := range rec.JobIDs {
+			protected[jobID] = struct{}{}
+		}
+	}
+	return protected
+}
+
 func (s *store) gcLoop() {
 	t := time.NewTicker(time.Minute)
 	defer t.Stop()
@@ -866,6 +1127,7 @@ func (s *store) gcLoop() {
 			cutoff := time.Now().Add(-s.cfg.Retention)
 			var removePaths []string
 			s.mu.Lock()
+			protected := s.protectedJobsLocked(cutoff)
 			for id, j := range s.jobs {
 				j.mu.Lock()
 				terminal := isTerminalState(j.State)
@@ -875,6 +1137,9 @@ func (s *store) gcLoop() {
 				idempotencyKey := j.IdempotencyKey
 				j.mu.Unlock()
 				if expired {
+					if _, keep := protected[id]; keep {
+						continue
+					}
 					if idempotencyKey != "" {
 						mapKey := idempotencyMapKey(owner, idempotencyKey)
 						if s.idempotency[mapKey] == id {
@@ -885,25 +1150,11 @@ func (s *store) gcLoop() {
 					removePaths = append(removePaths, path)
 				}
 			}
-			for key, rec := range s.graphs {
-				if rec.CreatedAt.After(cutoff) {
-					continue
-				}
-				allGone := true
-				for _, jobID := range rec.JobIDs {
-					if _, exists := s.jobs[jobID]; exists {
-						allGone = false
-						break
-					}
-				}
-				if allGone {
-					delete(s.graphs, key)
-				}
-			}
 			s.mu.Unlock()
 			for _, p := range removePaths {
 				_ = os.Remove(p)
 			}
+			s.sweepOrphanOutputs(cutoff)
 		case <-s.stop:
 			return
 		}

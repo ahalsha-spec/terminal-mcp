@@ -1,7 +1,13 @@
 package job
 
 import (
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -537,5 +543,556 @@ func TestGraphAdmissionIsAllOrNothing(t *testing.T) {
 	jobs, _ := List("a")
 	if len(jobs) != 1 || jobs[0].JobID != blocker.JobID {
 		t.Fatalf("graph admission was partial; jobs=%+v", jobs)
+	}
+}
+
+func TestDetachedChildCannotOutliveSuccessfulJob(t *testing.T) {
+	if !jobCgroupIsolationAvailable() {
+		t.Skip("cgroup v2 job isolation unavailable")
+	}
+	Init(testConfig(t, 2, 8, 8, 1))
+	defer Shutdown()
+
+	job, err := Submit("a", SubmitArgs{Command: "setsid sh -c 'sleep 30' >/dev/null 2>&1 & echo $!"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := waitState(t, "a", job.JobID, true)
+	if done.State != "succeeded" {
+		t.Fatalf("job state=%s err=%s", done.State, done.Error)
+	}
+	res, err := ResultFor("a", job.JobID, 4096)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(res.Output))
+	if err != nil {
+		t.Fatalf("parse detached pid from %q: %v", res.Output, err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("detached child %d survived completed job", pid)
+}
+
+func TestOwnerSetPrunesAfterQueuesDrain(t *testing.T) {
+	Init(testConfig(t, 4, 128, 4, 2))
+	defer Shutdown()
+
+	type owned struct{ owner, id string }
+	jobs := make([]owned, 0, 40)
+	for i := 0; i < 40; i++ {
+		owner := fmt.Sprintf("owner-prune-%02d", i)
+		snap, err := Submit(owner, SubmitArgs{Command: "echo done"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		jobs = append(jobs, owned{owner: owner, id: snap.JobID})
+	}
+	for _, j := range jobs {
+		if got := waitState(t, j.owner, j.id, true); got.State != "succeeded" {
+			t.Fatalf("job %s ended %s", j.id, got.State)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s := current()
+		s.mu.Lock()
+		owners := len(s.owners)
+		queues := len(s.queues)
+		s.mu.Unlock()
+		if owners == 0 && queues == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	s := current()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t.Fatalf("historical owners retained after drain: owners=%d queues=%d", len(s.owners), len(s.queues))
+}
+
+func TestSupersessionUsesNormalizedKey(t *testing.T) {
+	Init(testConfig(t, 1, 8, 8, 1))
+	defer Shutdown()
+
+	old, err := Submit("a", SubmitArgs{Command: "sleep 2", SupersedeKey: "build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", old.JobID, false)
+	fresh, err := Submit("a", SubmitArgs{Command: "echo fresh", SupersedeKey: "  build  "})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitState(t, "a", old.JobID, true); got.State != "canceled" {
+		t.Fatalf("normalized supersession did not cancel old job: %+v", got)
+	}
+	if got := waitState(t, "a", fresh.JobID, true); got.State != "succeeded" {
+		t.Fatalf("fresh job state=%s err=%s", got.State, got.Error)
+	}
+}
+
+func TestTighterMemoryEnvelopeUsesCgroupBudget(t *testing.T) {
+	const gib = uint64(1 << 30)
+	total, available := tighterMemoryEnvelope(8*gib, 6*gib, 2*gib, 3*gib)
+	if total != 3*gib || available != 1*gib {
+		t.Fatalf("cgroup-tight envelope total=%d available=%d", total, available)
+	}
+	total, available = tighterMemoryEnvelope(8*gib, 1*gib, 1*gib, 5*gib)
+	if total != 8*gib || available != 1*gib {
+		t.Fatalf("global-tight envelope total=%d available=%d", total, available)
+	}
+}
+
+func TestCgroupMemoryBudgetPrefersHighBeforeMax(t *testing.T) {
+	const gib = uint64(1 << 30)
+	dir := t.TempDir()
+	if err := os.WriteFile(dir+"/memory.current", []byte(strconv.FormatUint(2*gib, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/memory.high", []byte(strconv.FormatUint(3*gib, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dir+"/memory.max", []byte(strconv.FormatUint(5*gib, 10)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	current, budget := readCgroupMemoryBudget(dir)
+	if current != 2*gib || budget != 3*gib {
+		t.Fatalf("current=%d budget=%d", current, budget)
+	}
+}
+
+func TestOrphanOutputSweepPreservesKnownJobs(t *testing.T) {
+	cfg := testConfig(t, 2, 8, 8, 1)
+	Init(cfg)
+	defer Shutdown()
+
+	known, err := Submit("a", SubmitArgs{Command: "echo known"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitState(t, "a", known.JobID, true); got.State != "succeeded" {
+		t.Fatalf("known job state=%s err=%s", got.State, got.Error)
+	}
+
+	s := current()
+	s.mu.Lock()
+	knownPath := s.jobs[known.JobID].OutputPath
+	dataDir := s.cfg.DataDir
+	s.mu.Unlock()
+	old := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(knownPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	orphanPath := filepath.Join(dataDir, "jobs", "orphan.log")
+	if err := os.WriteFile(orphanPath, []byte("orphan"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(orphanPath, old, old); err != nil {
+		t.Fatal(err)
+	}
+
+	s.sweepOrphanOutputs(time.Now().Add(-time.Hour))
+	if _, err := os.Stat(orphanPath); !os.IsNotExist(err) {
+		t.Fatalf("orphan output not swept: %v", err)
+	}
+	if _, err := os.Stat(knownPath); err != nil {
+		t.Fatalf("known job output was swept: %v", err)
+	}
+}
+
+func TestGCKeepsLiveDependenciesAndWholeGraphGeneration(t *testing.T) {
+	Init(testConfig(t, 2, 16, 16, 1))
+	defer Shutdown()
+
+	graph, err := SubmitGraph("a", GraphSubmitArgs{
+		GraphKey: "gc-protected-graph",
+		Nodes: []GraphNodeArgs{
+			{NodeID: "root", Command: "echo root"},
+			{NodeID: "child", Command: "sleep 0.30; echo child", DependsOn: []string{"root"}},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ids := map[string]string{}
+	for _, node := range graph.Nodes {
+		ids[node.NodeID] = node.Job.JobID
+	}
+	rootDone := waitState(t, "a", ids["root"], true)
+	if rootDone.State != "succeeded" {
+		t.Fatalf("root state=%s", rootDone.State)
+	}
+	waitState(t, "a", ids["child"], false)
+
+	s := current()
+	old := time.Now().Add(-2 * time.Hour)
+	cutoff := time.Now().Add(-time.Hour)
+	s.mu.Lock()
+	root := s.jobs[ids["root"]]
+	root.mu.Lock()
+	root.FinishedAt = old
+	root.mu.Unlock()
+	protected := s.protectedJobsLocked(cutoff)
+	_, rootProtected := protected[ids["root"]]
+	_, graphPresent := s.graphs[graphMapKey("a", "gc-protected-graph")]
+	s.mu.Unlock()
+	if !rootProtected || !graphPresent {
+		t.Fatalf("live graph lost protection: rootProtected=%v graphPresent=%v", rootProtected, graphPresent)
+	}
+
+	childDone := waitState(t, "a", ids["child"], true)
+	if childDone.State != "succeeded" {
+		t.Fatalf("child state=%s err=%s", childDone.State, childDone.Error)
+	}
+	s.mu.Lock()
+	for _, id := range ids {
+		j := s.jobs[id]
+		j.mu.Lock()
+		j.FinishedAt = old
+		j.mu.Unlock()
+	}
+	protected = s.protectedJobsLocked(cutoff)
+	_, graphPresent = s.graphs[graphMapKey("a", "gc-protected-graph")]
+	_, rootProtected = protected[ids["root"]]
+	s.mu.Unlock()
+	if graphPresent || rootProtected {
+		t.Fatalf("expired terminal graph still retained: graphPresent=%v rootProtected=%v", graphPresent, rootProtected)
+	}
+}
+
+func TestGCProtectsStandaloneDependencyOfRunningJob(t *testing.T) {
+	Init(testConfig(t, 2, 16, 16, 1))
+	defer Shutdown()
+
+	dep, err := Submit("a", SubmitArgs{Command: "echo dep"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitState(t, "a", dep.JobID, true); got.State != "succeeded" {
+		t.Fatalf("dep state=%s", got.State)
+	}
+	child, err := Submit("a", SubmitArgs{Command: "sleep 0.30", DependsOn: []string{dep.JobID}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", child.JobID, false)
+
+	s := current()
+	s.mu.Lock()
+	d := s.jobs[dep.JobID]
+	d.mu.Lock()
+	d.FinishedAt = time.Now().Add(-2 * time.Hour)
+	d.mu.Unlock()
+	protected := s.protectedJobsLocked(time.Now().Add(-time.Hour))
+	_, ok := protected[dep.JobID]
+	s.mu.Unlock()
+	if !ok {
+		t.Fatal("running dependent did not protect its dependency from GC")
+	}
+}
+
+func waitOutputPID(t *testing.T, owner, jobID string) int {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		res, err := ResultFor(owner, jobID, 4096)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if raw := strings.TrimSpace(res.Output); raw != "" {
+			pid, err := strconv.Atoi(strings.Fields(raw)[0])
+			if err != nil {
+				t.Fatalf("parse child pid from %q: %v", raw, err)
+			}
+			return pid
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for detached child pid output")
+	return 0
+}
+
+func waitProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(fmt.Sprintf("/proc/%d", pid)); os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d survived job containment cleanup", pid)
+}
+
+func TestCancelKillsDetachedDescendants(t *testing.T) {
+	if !jobCgroupIsolationAvailable() {
+		t.Skip("cgroup v2 job isolation unavailable")
+	}
+	Init(testConfig(t, 1, 8, 8, 1))
+	defer Shutdown()
+
+	snap, err := Submit("a", SubmitArgs{Command: "setsid sh -c 'sleep 30' >/dev/null 2>&1 & echo $!; sleep 30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", snap.JobID, false)
+	pid := waitOutputPID(t, "a", snap.JobID)
+	if _, err := Cancel("a", snap.JobID); err != nil {
+		t.Fatal(err)
+	}
+	done := waitState(t, "a", snap.JobID, true)
+	if done.State != "canceled" {
+		t.Fatalf("canceled job state=%s err=%s", done.State, done.Error)
+	}
+	waitProcessGone(t, pid)
+}
+
+func TestTimeoutKillsDetachedDescendants(t *testing.T) {
+	if !jobCgroupIsolationAvailable() {
+		t.Skip("cgroup v2 job isolation unavailable")
+	}
+	cfg := testConfig(t, 1, 8, 8, 1)
+	cfg.DefaultTimeout = 150 * time.Millisecond
+	Init(cfg)
+	defer Shutdown()
+
+	snap, err := Submit("a", SubmitArgs{Command: "setsid sh -c 'sleep 30' >/dev/null 2>&1 & echo $!; sleep 30", Timeout: 150 * time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", snap.JobID, false)
+	pid := waitOutputPID(t, "a", snap.JobID)
+	done := waitState(t, "a", snap.JobID, true)
+	if done.State != "timed_out" {
+		t.Fatalf("timed out job state=%s err=%s", done.State, done.Error)
+	}
+	waitProcessGone(t, pid)
+}
+
+func TestRejectedReplacementPreservesRunningIncumbent(t *testing.T) {
+	Init(testConfig(t, 1, 1, 1, 1))
+	defer Shutdown()
+
+	incumbent, err := Submit("a", SubmitArgs{Command: "sleep 0.25; echo incumbent", SupersedeKey: "build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", incumbent.JobID, false)
+	filler, err := Submit("b", SubmitArgs{Command: "echo filler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Submit("a", SubmitArgs{Command: "echo replacement", SupersedeKey: "build"}); err == nil {
+		t.Fatal("expected replacement admission rejection")
+	}
+	inc, err := Status("a", incumbent.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inc.CancelRequested {
+		t.Fatalf("rejected replacement canceled incumbent: %+v", inc)
+	}
+	if got := waitState(t, "a", incumbent.JobID, true); got.State != "succeeded" {
+		t.Fatalf("incumbent state=%s err=%s", got.State, got.Error)
+	}
+	if got := waitState(t, "b", filler.JobID, true); got.State != "succeeded" {
+		t.Fatalf("filler state=%s err=%s", got.State, got.Error)
+	}
+}
+
+func TestQueuedSupersessionFreesAdmissionCapacity(t *testing.T) {
+	Init(testConfig(t, 1, 1, 1, 1))
+	defer Shutdown()
+
+	blocker, err := Submit("b", SubmitArgs{Command: "sleep 0.25"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "b", blocker.JobID, false)
+	stale, err := Submit("a", SubmitArgs{Command: "echo stale", SupersedeKey: "build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fresh, err := Submit("a", SubmitArgs{Command: "echo fresh", SupersedeKey: "build"})
+	if err != nil {
+		t.Fatalf("replacement should consume superseded queue capacity: %v", err)
+	}
+	staleDone := waitState(t, "a", stale.JobID, true)
+	if staleDone.State != "canceled" {
+		t.Fatalf("stale state=%s", staleDone.State)
+	}
+	if got := waitState(t, "a", fresh.JobID, true); got.State != "succeeded" {
+		t.Fatalf("fresh state=%s err=%s", got.State, got.Error)
+	}
+}
+
+func TestJobCannotSupersedeOwnDependency(t *testing.T) {
+	Init(testConfig(t, 1, 4, 4, 1))
+	defer Shutdown()
+
+	dep, err := Submit("a", SubmitArgs{Command: "sleep 0.20; echo dep", SupersedeKey: "build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", dep.JobID, false)
+	if _, err := Submit("a", SubmitArgs{Command: "echo child", SupersedeKey: "build", DependsOn: []string{dep.JobID}}); err == nil {
+		t.Fatal("expected supersede-own-dependency rejection")
+	}
+	status, err := Status("a", dep.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CancelRequested {
+		t.Fatalf("rejected dependent canceled dependency: %+v", status)
+	}
+	if got := waitState(t, "a", dep.JobID, true); got.State != "succeeded" {
+		t.Fatalf("dependency state=%s err=%s", got.State, got.Error)
+	}
+}
+
+func TestGraphSupersessionFreesAdmissionCapacity(t *testing.T) {
+	Init(testConfig(t, 1, 2, 2, 1))
+	defer Shutdown()
+
+	blocker, err := Submit("b", SubmitArgs{Command: "sleep 0.30"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "b", blocker.JobID, false)
+	stale1, err := Submit("a", SubmitArgs{Command: "echo stale1", SupersedeKey: "graph-build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	stale2, err := Submit("a", SubmitArgs{Command: "echo stale2", SupersedeKey: "graph-build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	graph, err := SubmitGraph("a", GraphSubmitArgs{GraphKey: "replacement-graph", Nodes: []GraphNodeArgs{
+		{NodeID: "left", Command: "echo left", SupersedeKey: "graph-build"},
+		{NodeID: "right", Command: "echo right", SupersedeKey: "graph-build"},
+	}})
+	if err != nil {
+		t.Fatalf("replacement graph should consume superseded queue capacity: %v", err)
+	}
+	if len(graph.Nodes) != 2 {
+		t.Fatalf("graph nodes=%d", len(graph.Nodes))
+	}
+	for _, stale := range []Snapshot{stale1, stale2} {
+		if got := waitState(t, "a", stale.JobID, true); got.State != "canceled" {
+			t.Fatalf("stale graph predecessor %s state=%s", stale.JobID, got.State)
+		}
+	}
+	for _, node := range graph.Nodes {
+		if got := waitState(t, "a", node.Job.JobID, true); got.State != "succeeded" {
+			t.Fatalf("replacement graph node %s state=%s err=%s", node.NodeID, got.State, got.Error)
+		}
+	}
+}
+
+func TestRejectedGraphPreservesRunningIncumbent(t *testing.T) {
+	Init(testConfig(t, 1, 1, 1, 1))
+	defer Shutdown()
+
+	incumbent, err := Submit("a", SubmitArgs{Command: "sleep 0.25; echo incumbent", SupersedeKey: "graph-build"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitState(t, "a", incumbent.JobID, false)
+	filler, err := Submit("b", SubmitArgs{Command: "echo filler"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := SubmitGraph("a", GraphSubmitArgs{Nodes: []GraphNodeArgs{{NodeID: "replacement", Command: "echo replacement", SupersedeKey: "graph-build"}}}); err == nil {
+		t.Fatal("expected graph admission rejection")
+	}
+	status, err := Status("a", incumbent.JobID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.CancelRequested {
+		t.Fatalf("rejected graph canceled incumbent: %+v", status)
+	}
+	if got := waitState(t, "a", incumbent.JobID, true); got.State != "succeeded" {
+		t.Fatalf("incumbent state=%s err=%s", got.State, got.Error)
+	}
+	if got := waitState(t, "b", filler.JobID, true); got.State != "succeeded" {
+		t.Fatalf("filler state=%s err=%s", got.State, got.Error)
+	}
+}
+
+func TestPrepareCgroupIsolationPreservesActiveSibling(t *testing.T) {
+	if !jobCgroupIsolationAvailable() {
+		t.Skip("cgroup v2 job isolation unavailable")
+	}
+	base, ok := currentCgroupV2Base()
+	if !ok {
+		t.Skip("no cgroup v2 base")
+	}
+
+	cmd := exec.Command("sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	pid := cmd.Process.Pid
+	start, ok := processStartTicks(pid)
+	if !ok {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal("could not read sibling process start time")
+	}
+	sibling := filepath.Join(base, fmt.Sprintf("%s%d-%s", workerCgroupPrefix, pid, start))
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatal(err)
+	}
+	g := &jobCgroup{path: sibling}
+	defer func() {
+		_ = g.terminateAndRemove()
+		_ = cmd.Wait()
+	}()
+	if err := os.WriteFile(filepath.Join(sibling, "cgroup.procs"), []byte(strconv.Itoa(pid)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareJobCgroupIsolation(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(sibling); err != nil {
+		t.Fatalf("active sibling namespace was reaped: %v", err)
+	}
+	if err := cmd.Process.Signal(os.Signal(syscall.Signal(0))); err != nil {
+		t.Fatalf("active sibling process was killed: %v", err)
+	}
+}
+
+func TestPrepareCgroupIsolationReapsDeadSibling(t *testing.T) {
+	if !jobCgroupIsolationAvailable() {
+		t.Skip("cgroup v2 job isolation unavailable")
+	}
+	base, ok := currentCgroupV2Base()
+	if !ok {
+		t.Skip("no cgroup v2 base")
+	}
+	stale := filepath.Join(base, workerCgroupPrefix+"99999999-1")
+	_ = os.Remove(stale)
+	if err := os.Mkdir(stale, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareJobCgroupIsolation(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Fatalf("dead sibling namespace not reaped: %v", err)
 	}
 }

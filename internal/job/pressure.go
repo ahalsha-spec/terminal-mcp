@@ -12,13 +12,15 @@ import (
 )
 
 type Pressure struct {
-	SampledAt            time.Time
-	EffectiveCPU         int
-	CPUSomeAvg10         float64
-	MemorySomeAvg10      float64
-	IOFullAvg10          float64
-	MemoryAvailableBytes uint64
-	MemoryTotalBytes     uint64
+	SampledAt                time.Time
+	EffectiveCPU             int
+	CPUSomeAvg10             float64
+	MemorySomeAvg10          float64
+	IOFullAvg10              float64
+	MemoryAvailableBytes     uint64
+	MemoryTotalBytes         uint64
+	MemoryCgroupCurrentBytes uint64
+	MemoryCgroupBudgetBytes  uint64
 }
 
 func (p Pressure) MemoryAvailableRatio() float64 {
@@ -125,7 +127,77 @@ func readPressure() Pressure {
 		p.IOFullAvg10 = readPSI("/proc/pressure/io", "full")
 	}
 	p.MemoryTotalBytes, p.MemoryAvailableBytes = readMemInfo()
+	if cg != "" {
+		base := filepath.Join("/sys/fs/cgroup", cg)
+		p.MemoryCgroupCurrentBytes, p.MemoryCgroupBudgetBytes = readCgroupMemoryBudget(base)
+		p.MemoryTotalBytes, p.MemoryAvailableBytes = tighterMemoryEnvelope(
+			p.MemoryTotalBytes, p.MemoryAvailableBytes,
+			p.MemoryCgroupCurrentBytes, p.MemoryCgroupBudgetBytes,
+		)
+	}
 	return p
+}
+
+func tighterMemoryEnvelope(globalTotal, globalAvailable, current, budget uint64) (uint64, uint64) {
+	if budget == 0 {
+		return globalTotal, globalAvailable
+	}
+	cgroupAvailable := uint64(0)
+	if current < budget {
+		cgroupAvailable = budget - current
+	}
+	if globalTotal == 0 {
+		return budget, cgroupAvailable
+	}
+	globalRatio := float64(globalAvailable) / float64(globalTotal)
+	cgroupRatio := float64(cgroupAvailable) / float64(budget)
+	if cgroupRatio < globalRatio {
+		return budget, cgroupAvailable
+	}
+	return globalTotal, globalAvailable
+}
+
+func readUintFile(path string) uint64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	v, err := strconv.ParseUint(strings.TrimSpace(string(b)), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func readLimitFile(path string) uint64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return 0
+	}
+	raw := strings.TrimSpace(string(b))
+	if raw == "" || raw == "max" {
+		return 0
+	}
+	v, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return v
+}
+
+func readCgroupMemoryBudget(base string) (current, budget uint64) {
+	current = readUintFile(filepath.Join(base, "memory.current"))
+	high := readLimitFile(filepath.Join(base, "memory.high"))
+	max := readLimitFile(filepath.Join(base, "memory.max"))
+	switch {
+	case high > 0 && max > 0 && high < max:
+		budget = high
+	case high > 0:
+		budget = high
+	default:
+		budget = max
+	}
+	return current, budget
 }
 
 func selfCgroupPath() string {

@@ -83,6 +83,13 @@ The agent opens a session, runs commands, and streams back results. If it needs 
 
 | Tool | What it does |
 | --- | --- |
+| `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?)` | Submit bounded non-interactive work without consuming a persistent PTY. Supports atomic supersession, exact-retry idempotency, dependencies, and global resource locks. |
+| `job_batch_submit(items)` | Admit a bounded batch in one MCP call. Each item is independently admitted/rejected under global and per-caller backpressure. |
+| `job_graph_submit(graph_key?, nodes)` | Atomically validate and admit a named dependency DAG. Independent nodes fan out; dependency and lock edges serialize only what must serialize. |
+| `job_status(job_id)` | Read one caller-owned job's lifecycle state. |
+| `job_result(job_id, max_bytes?)` | Read a bounded tail of caller-owned disk-backed output; bulk output stays local. |
+| `job_cancel(job_id)` | Cancel queued/running caller-owned work. Running descendants are reclaimed with the job. |
+| `job_list()` | List caller-owned jobs and global scheduler capacity/pressure telemetry. |
 | `terminal_open(mode, command?, host?)` | Start a persistent PTY session. `mode=local` or `mode=ssh`. Returns `session_id` + `terminal_url`. |
 | `terminal_send(session_id, input, wait_ms?)` | Type a command, wait for it to settle. Returns output, state, exit_code. |
 | `terminal_output(session_id, wait_ms?, mode?)` | Observe live output. `tail` (peek at the screen; doesn't advance the cursor) or `since_last` (full increment since last call; advances the cursor; also the record of human-takeover commands). |
@@ -91,6 +98,9 @@ The agent opens a session, runs commands, and streams back results. If it needs 
 | `terminal_status(session_id)` | Lightweight state / prompt / exit_code / held query. |
 | `terminal_close(session_id)` | Close the session, reclaim the process group. |
 | `terminal_list()` | List active sessions. |
+
+
+The non-interactive job plane separates **logical demand from physical execution**: many callers may queue work, while a bounded adaptive scheduler controls what actually runs. On Linux cgroup v2, each server process owns a PID+start-time worker namespace and every admitted job runs in its own child cgroup. Success, failure, cancel, and timeout all reap that whole descendant subtree before the scheduler releases capacity; active sibling server namespaces are never swept, while namespaces whose owning process is provably dead are reclaimed on startup. If cgroup v2 is present but safe containment cannot be prepared, jobs fail closed. Systems without cgroup v2 retain the process-group fallback. Persistent PTYs remain a separate resource for genuinely interactive work.
 
 ## Configure
 

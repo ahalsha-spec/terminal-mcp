@@ -227,15 +227,22 @@ func SubmitGraph(owner string, in GraphSubmitArgs) (GraphResult, error) {
 		}
 	}
 
-	queued := s.queuedCountLocked()
+	supersedeKeys := map[string]struct{}{}
+	for _, node := range nodes {
+		if node.SupersedeKey != "" {
+			supersedeKeys[node.SupersedeKey] = struct{}{}
+		}
+	}
+	plan := s.planSupersessionLocked(owner, supersedeKeys)
+	queued := s.queuedCountLocked() - len(plan.queued)
 	if queued+len(nodes) > s.cfg.MaxQueued {
 		s.mu.Unlock()
-		return GraphResult{}, fmt.Errorf("graph admission would exceed global queue: %d+%d > %d", queued, len(nodes), s.cfg.MaxQueued)
+		return GraphResult{}, fmt.Errorf("graph admission would exceed global queue after supersession plan: %d+%d > %d", queued, len(nodes), s.cfg.MaxQueued)
 	}
-	ownerQueued := len(s.queues[owner])
+	ownerQueued := len(s.queues[owner]) - len(plan.queued)
 	if ownerQueued+len(nodes) > s.cfg.MaxQueuedPerOwner {
 		s.mu.Unlock()
-		return GraphResult{}, fmt.Errorf("graph admission would exceed owner queue: %d+%d > %d", ownerQueued, len(nodes), s.cfg.MaxQueuedPerOwner)
+		return GraphResult{}, fmt.Errorf("graph admission would exceed owner queue after supersession plan: %d+%d > %d", ownerQueued, len(nodes), s.cfg.MaxQueuedPerOwner)
 	}
 
 	jobsByNode := make(map[string]*Job, len(nodes))
@@ -266,30 +273,7 @@ func SubmitGraph(owner string, in GraphSubmitArgs) (GraphResult, error) {
 		}
 	}
 
-	for _, node := range nodes {
-		if node.SupersedeKey == "" {
-			continue
-		}
-		for _, existing := range s.jobs {
-			if existing.Owner != owner || existing.SupersedeKey != node.SupersedeKey {
-				continue
-			}
-			existing.mu.Lock()
-			switch existing.State {
-			case "queued":
-				existing.State = "canceled"
-				existing.CancelRequested = true
-				existing.FinishedAt = time.Now()
-				s.removeQueuedLocked(existing)
-			case "running":
-				existing.CancelRequested = true
-				if existing.cancel != nil {
-					cancels = append(cancels, existing.cancel)
-				}
-			}
-			existing.mu.Unlock()
-		}
-	}
+	cancels = s.applySupersessionLocked(plan)
 
 	if _, exists := s.queues[owner]; !exists {
 		s.owners = append(s.owners, owner)

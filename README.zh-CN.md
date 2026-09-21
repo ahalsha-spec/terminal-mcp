@@ -83,6 +83,13 @@ Agent 会开会话、跑命令、把结果流式带回。如果它需要输密�
 
 | 工具 | 作用 |
 | --- | --- |
+| `job_submit(command, cwd?, class?, supersede_key?, idempotency_key?, depends_on?, lock_keys?, timeout_seconds?)` | 提交有界的非交互任务，不占用持久 PTY；支持事务化 supersession、精确重试幂等、依赖与全局资源锁。 |
+| `job_batch_submit(items)` | 一次 MCP 调用提交有界批次；每项按全局/调用方背压独立接纳或拒绝。 |
+| `job_graph_submit(graph_key?, nodes)` | 原子校验并接纳命名依赖 DAG；独立节点并发，仅由真实依赖与锁边串行化。 |
+| `job_status(job_id)` | 读取当前调用方拥有的单个任务状态。 |
+| `job_result(job_id, max_bytes?)` | 读取当前调用方任务的有界磁盘输出尾部；大体量输出留在本机。 |
+| `job_cancel(job_id)` | 取消排队或运行中的当前调用方任务，并回收运行后代。 |
+| `job_list()` | 列出当前调用方任务，以及全局调度容量/压力遥测。 |
 | `terminal_open(mode, command?, host?)` | 起一个持久 PTY 会话。`mode=local` 或 `mode=ssh`。返回 `session_id` + `terminal_url`。 |
 | `terminal_send(session_id, input, wait_ms?)` | 输入命令并等它稳定，返回输出、状态、退出码。 |
 | `terminal_output(session_id, wait_ms?, mode?)` | 观察实时输出。`tail`（瞥一眼当前屏，不推进游标）或 `since_last`（上次以来的完整增量，推进游标；也是人工接管命令的记录来源）。 |
@@ -91,6 +98,9 @@ Agent 会开会话、跑命令、把结果流式带回。如果它需要输密�
 | `terminal_status(session_id)` | 轻量查询 状态 / 提示符 / 退出码 / 是否被接管。 |
 | `terminal_close(session_id)` | 关闭会话，回收进程组。 |
 | `terminal_list()` | 列出活跃会话。 |
+
+
+非交互 job plane 将**逻辑需求与物理执行解耦**：许多调用方可以排队提交工作，而有界自适应调度器只放行机器当前能够安全承载的物理执行。在 Linux cgroup v2 上，每个 server 进程拥有基于 PID + 进程启动时间的 worker 命名空间，每个已接纳 job 进入独立子 cgroup；成功、失败、取消和超时都会在释放调度容量前回收完整后代子树。启动清理不会碰仍存活的兄弟 server 命名空间，只回收其属主进程已被证明死亡的残留命名空间。若检测到 cgroup v2 但无法安全准备 containment，job 会 fail closed；没有 cgroup v2 的系统保留进程组 fallback。持久 PTY 仍是独立资源，只用于真正需要交互状态的工作。
 
 ## 配置
 
